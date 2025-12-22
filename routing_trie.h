@@ -1,0 +1,344 @@
+/*
+ * Signalforge Routing Extension
+ * routing_trie.h - Radix trie data structures and function declarations
+ *
+ * Copyright (c) 2024 Signalforge
+ * License: MIT
+ */
+
+#ifndef SIGNALFORGE_ROUTING_TRIE_H
+#define SIGNALFORGE_ROUTING_TRIE_H
+
+#include "php.h"
+#include "zend_API.h"
+#include "zend_smart_str.h"
+#include <pcre2.h>
+
+/* Forward declarations */
+typedef struct _sf_trie_node sf_trie_node;
+typedef struct _sf_route sf_route;
+typedef struct _sf_route_group sf_route_group;
+typedef struct _sf_match_result sf_match_result;
+typedef struct _sf_router sf_router;
+
+/* HTTP method enumeration */
+typedef enum {
+    SF_METHOD_GET     = 0,
+    SF_METHOD_POST    = 1,
+    SF_METHOD_PUT     = 2,
+    SF_METHOD_PATCH   = 3,
+    SF_METHOD_DELETE  = 4,
+    SF_METHOD_OPTIONS = 5,
+    SF_METHOD_HEAD    = 6,
+    SF_METHOD_ANY     = 7,
+    SF_METHOD_COUNT   = 8
+} sf_http_method;
+
+/* Trie node type enumeration */
+typedef enum {
+    SF_NODE_STATIC         = 0,  /* Literal path segment */
+    SF_NODE_PARAM          = 1,  /* Required parameter {name} */
+    SF_NODE_PARAM_OPTIONAL = 2,  /* Optional parameter {name?} */
+    SF_NODE_WILDCARD       = 3,  /* Catch-all {name*} or {name...} */
+    SF_NODE_ROOT           = 4   /* Root node marker */
+} sf_node_type;
+
+/* Parameter constraint structure */
+typedef struct _sf_param_constraint {
+    zend_string *name;              /* Parameter name */
+    zend_string *pattern;           /* Original regex pattern */
+    pcre2_code *compiled_regex;     /* Compiled PCRE2 regex */
+    pcre2_match_data *match_data;   /* Reusable match data */
+    zval default_value;             /* Default value for optional params */
+    zend_bool has_default;          /* Whether default is set */
+    zend_bool is_optional;          /* Is this parameter optional */
+} sf_param_constraint;
+
+/* Middleware entry */
+typedef struct _sf_middleware_entry {
+    zend_string *name;              /* Middleware identifier */
+    zval parameters;                /* Middleware parameters (array) */
+    struct _sf_middleware_entry *next;
+} sf_middleware_entry;
+
+/* Route definition structure */
+struct _sf_route {
+    zend_string *uri;               /* Original URI pattern */
+    zend_string *name;              /* Route name (nullable) */
+    zend_string *action_namespace;  /* Controller namespace */
+    zval handler;                   /* Callable or controller@method string */
+    zend_fcall_info fci;            /* Prepared call info */
+    zend_fcall_info_cache fcc;      /* Prepared call cache */
+    zend_bool handler_prepared;     /* Whether fci/fcc are prepared */
+    sf_middleware_entry *middleware_head; /* Linked list of middleware */
+    sf_middleware_entry *middleware_tail;
+    uint32_t middleware_count;
+    HashTable *wheres;              /* Parameter constraints {name => pattern} */
+    HashTable *defaults;            /* Default parameter values */
+    zval meta;                      /* Additional metadata (array) */
+    sf_http_method method;          /* HTTP method */
+    zend_string *domain;            /* Domain/subdomain constraint */
+    pcre2_code *domain_regex;       /* Compiled domain regex */
+    uint32_t priority;              /* Route priority (lower = higher priority) */
+    zend_bool is_fallback;          /* Is this a fallback route */
+    zend_object *php_object;        /* Associated PHP Route object */
+    uint32_t refcount;              /* Reference count */
+};
+
+/* Trie node structure */
+struct _sf_trie_node {
+    sf_node_type type;              /* Node type */
+    zend_string *segment;           /* Path segment (static) or empty for params */
+    zend_string *param_name;        /* Parameter name (for PARAM types) */
+    sf_param_constraint *constraint;/* Parameter constraint (owned) */
+
+    /* Children storage - hash table for static, single pointer for param */
+    HashTable *static_children;     /* Static segment children {segment => node} */
+    sf_trie_node *param_child;      /* Single parameter child */
+    sf_trie_node *optional_child;   /* Single optional parameter child */
+    sf_trie_node *wildcard_child;   /* Single wildcard child */
+
+    /* Terminal information */
+    sf_route *route;                /* Route if this is a terminal node */
+    zend_bool is_terminal;          /* Is this a terminal node */
+
+    /* Tree navigation */
+    sf_trie_node *parent;           /* Parent node */
+    uint32_t depth;                 /* Depth in tree */
+};
+
+/* Match result structure */
+struct _sf_match_result {
+    sf_route *route;                /* Matched route (borrowed reference) */
+    HashTable *params;              /* Extracted parameters {name => value} */
+    zend_bool matched;              /* Whether a match was found */
+    zend_string *error;             /* Error message if match failed */
+};
+
+/* Route group context */
+struct _sf_route_group {
+    zend_string *prefix;            /* URI prefix */
+    zend_string *namespace;         /* Controller namespace */
+    zend_string *name_prefix;       /* Route name prefix */
+    zend_string *domain;            /* Domain constraint */
+    sf_middleware_entry *middleware_head;
+    sf_middleware_entry *middleware_tail;
+    HashTable *wheres;              /* Shared parameter constraints */
+    struct _sf_route_group *parent; /* Parent group (for nesting) */
+};
+
+/* Router state */
+struct _sf_router {
+    sf_trie_node *method_tries[SF_METHOD_COUNT]; /* Per-method trie roots */
+    HashTable *named_routes;        /* {name => route} for reverse routing */
+    HashTable *all_routes;          /* All registered routes */
+    sf_route_group *current_group;  /* Current group context */
+    sf_route *fallback_route;       /* Fallback route */
+    zend_bool is_immutable;         /* Locked during request */
+    zend_bool trailing_slash_strict;/* Strict trailing slash matching */
+    uint32_t route_count;           /* Total route count */
+
+#ifdef ZTS
+    MUTEX_T lock;                   /* Thread safety lock */
+#endif
+};
+
+/* ============================================================================
+ * Memory Management Functions
+ * ============================================================================ */
+
+/* Trie node lifecycle */
+sf_trie_node *sf_trie_node_create(sf_node_type type);
+void sf_trie_node_destroy(sf_trie_node *node);
+void sf_trie_node_destroy_recursive(sf_trie_node *node);
+
+/* Route lifecycle */
+sf_route *sf_route_create(void);
+void sf_route_addref(sf_route *route);
+void sf_route_release(sf_route *route);
+void sf_route_destroy(sf_route *route);
+
+/* Constraint lifecycle */
+sf_param_constraint *sf_constraint_create(zend_string *name);
+void sf_constraint_destroy(sf_param_constraint *constraint);
+zend_bool sf_constraint_set_pattern(sf_param_constraint *constraint, zend_string *pattern);
+zend_bool sf_constraint_validate(sf_param_constraint *constraint, zend_string *value);
+
+/* Middleware lifecycle */
+sf_middleware_entry *sf_middleware_create(zend_string *name);
+void sf_middleware_destroy(sf_middleware_entry *entry);
+void sf_middleware_list_destroy(sf_middleware_entry *head);
+sf_middleware_entry *sf_middleware_list_clone(sf_middleware_entry *head);
+
+/* Router lifecycle */
+sf_router *sf_router_create(void);
+void sf_router_destroy(sf_router *router);
+void sf_router_reset(sf_router *router);
+
+/* Match result lifecycle */
+sf_match_result *sf_match_result_create(void);
+void sf_match_result_destroy(sf_match_result *result);
+
+/* Route group lifecycle */
+sf_route_group *sf_route_group_create(void);
+void sf_route_group_destroy(sf_route_group *group);
+
+/* ============================================================================
+ * Route Registration Functions
+ * ============================================================================ */
+
+/* Parse URI into segments */
+typedef struct _sf_uri_segment {
+    zend_string *value;
+    sf_node_type type;
+    zend_string *param_name;
+    zend_bool is_optional;
+    struct _sf_uri_segment *next;
+} sf_uri_segment;
+
+sf_uri_segment *sf_parse_uri(const char *uri, size_t len);
+void sf_uri_segments_destroy(sf_uri_segment *head);
+
+/* Insert route into trie */
+zend_bool sf_trie_insert(sf_router *router, sf_http_method method,
+                         const char *uri, size_t uri_len, sf_route *route);
+
+/* Insert route with parsed segments */
+zend_bool sf_trie_insert_segments(sf_trie_node *root, sf_uri_segment *segments,
+                                  sf_route *route);
+
+/* Register route (high-level API) */
+sf_route *sf_router_add_route(sf_router *router, sf_http_method method,
+                              zend_string *uri, zval *handler);
+
+/* Route configuration */
+void sf_route_set_name(sf_route *route, zend_string *name);
+void sf_route_set_middleware(sf_route *route, zval *middleware);
+void sf_route_add_middleware(sf_route *route, zend_string *name, zval *params);
+void sf_route_set_where(sf_route *route, zend_string *param, zend_string *pattern);
+void sf_route_set_default(sf_route *route, zend_string *param, zval *value);
+void sf_route_set_domain(sf_route *route, zend_string *domain);
+
+/* ============================================================================
+ * Route Matching Functions
+ * ============================================================================ */
+
+/* Match URI against trie */
+sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
+                               const char *uri, size_t uri_len);
+
+/* Match with domain */
+sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method method,
+                                           const char *uri, size_t uri_len,
+                                           const char *domain, size_t domain_len);
+
+/* Internal matching - returns matched node */
+sf_trie_node *sf_trie_match_node(sf_trie_node *root, const char *uri, size_t uri_len,
+                                 HashTable *params);
+
+/* Validate extracted parameters against constraints */
+zend_bool sf_validate_params(sf_route *route, HashTable *params);
+
+/* ============================================================================
+ * Route Group Functions
+ * ============================================================================ */
+
+/* Begin a new group context */
+void sf_router_begin_group(sf_router *router, sf_route_group *group);
+
+/* End current group context */
+void sf_router_end_group(sf_router *router);
+
+/* Apply group settings to route */
+void sf_route_apply_group(sf_route *route, sf_route_group *group);
+
+/* ============================================================================
+ * URL Generation Functions
+ * ============================================================================ */
+
+/* Generate URL for named route */
+zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *params);
+
+/* Check if route exists */
+zend_bool sf_router_has_route(sf_router *router, zend_string *name);
+
+/* Get route by name */
+sf_route *sf_router_get_route(sf_router *router, zend_string *name);
+
+/* ============================================================================
+ * Serialization Functions (Route Caching)
+ * ============================================================================ */
+
+/* Serialize router to string */
+zend_string *sf_router_serialize(sf_router *router);
+
+/* Unserialize router from string */
+sf_router *sf_router_unserialize(const char *data, size_t len);
+
+/* Cache to file */
+zend_bool sf_router_cache_to_file(sf_router *router, const char *path);
+
+/* Load from file cache */
+sf_router *sf_router_load_from_file(const char *path);
+
+/* ============================================================================
+ * Utility Functions
+ * ============================================================================ */
+
+/* Convert method string to enum */
+sf_http_method sf_method_from_string(const char *method, size_t len);
+
+/* Convert method enum to string */
+const char *sf_method_to_string(sf_http_method method);
+
+/* Normalize URI (trailing slash handling) */
+zend_string *sf_normalize_uri(const char *uri, size_t len, zend_bool strip_trailing);
+
+/* Debug: dump trie structure */
+void sf_trie_dump(sf_trie_node *node, int depth);
+
+/* Debug: dump route */
+void sf_route_dump(sf_route *route);
+
+/* ============================================================================
+ * Thread Safety Macros
+ * ============================================================================ */
+
+#ifdef ZTS
+#define SF_ROUTER_LOCK(router)   tsrm_mutex_lock((router)->lock)
+#define SF_ROUTER_UNLOCK(router) tsrm_mutex_unlock((router)->lock)
+#else
+#define SF_ROUTER_LOCK(router)
+#define SF_ROUTER_UNLOCK(router)
+#endif
+
+/* ============================================================================
+ * Error Codes
+ * ============================================================================ */
+
+typedef enum {
+    SF_OK                    = 0,
+    SF_ERR_INVALID_URI       = 1,
+    SF_ERR_DUPLICATE_ROUTE   = 2,
+    SF_ERR_INVALID_HANDLER   = 3,
+    SF_ERR_INVALID_CONSTRAINT= 4,
+    SF_ERR_ROUTE_NOT_FOUND   = 5,
+    SF_ERR_METHOD_NOT_ALLOWED= 6,
+    SF_ERR_IMMUTABLE         = 7,
+    SF_ERR_MEMORY            = 8
+} sf_error_code;
+
+/* Global error state (per-request) */
+ZEND_BEGIN_MODULE_GLOBALS(signalforge_routing)
+    sf_error_code last_error;
+    char *last_error_msg;
+    sf_router *global_router;
+ZEND_END_MODULE_GLOBALS(signalforge_routing)
+
+#ifdef ZTS
+#define SF_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(signalforge_routing, v)
+#else
+#define SF_G(v) (signalforge_routing_globals.v)
+#endif
+
+#endif /* SIGNALFORGE_ROUTING_TRIE_H */
