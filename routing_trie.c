@@ -1294,10 +1294,12 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
     if (group->middleware_head) {
         sf_middleware_entry *cloned = sf_middleware_list_clone(group->middleware_head);
         if (cloned) {
-            /* Find end of cloned list */
+            /* Find end of cloned list and count entries */
             sf_middleware_entry *cloned_tail = cloned;
+            uint16_t cloned_count = 1;
             while (cloned_tail->next) {
                 cloned_tail = cloned_tail->next;
+                cloned_count++;
             }
             /* Append route's middleware */
             cloned_tail->next = route->middleware_head;
@@ -1305,6 +1307,8 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
             if (!route->middleware_tail) {
                 route->middleware_tail = cloned_tail;
             }
+            /* Update count */
+            route->middleware_count += cloned_count;
         }
     }
 
@@ -1777,91 +1781,551 @@ sf_route *sf_router_get_route(sf_router *router, zend_string *name)
 }
 
 /* ============================================================================
- * Serialization (Route Caching)
+ * Index Rebuilding (after cache load)
  * ============================================================================ */
 
-/* Serialize trie node recursively */
-static void sf_serialize_node(sf_trie_node *node, smart_str *buf)
+static void sf_rebuild_index_node(sf_router *router, sf_trie_node *node)
+{
+    if (!node) return;
+
+    /* If terminal, add to named routes and all routes */
+    if (node->is_terminal && node->route) {
+        if (node->route->name) {
+            zval zv;
+            ZVAL_PTR(&zv, node->route);
+            zend_hash_update(router->named_routes, node->route->name, &zv);
+        }
+        zval rv;
+        ZVAL_PTR(&rv, node->route);
+        zend_hash_next_index_insert(router->all_routes, &rv);
+        router->route_count++;
+    }
+
+    /* Traverse static children */
+    if (node->static_children) {
+        zval *child_zv;
+        ZEND_HASH_FOREACH_VAL(node->static_children, child_zv) {
+            sf_rebuild_index_node(router, (sf_trie_node *)Z_PTR_P(child_zv));
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    /* Traverse param children */
+    sf_rebuild_index_node(router, node->param_child);
+    sf_rebuild_index_node(router, node->optional_child);
+    sf_rebuild_index_node(router, node->wildcard_child);
+}
+
+static void sf_router_rebuild_index(sf_router *router)
+{
+    if (!router) return;
+
+    /* Clear existing indexes */
+    zend_hash_clean(router->named_routes);
+    zend_hash_clean(router->all_routes);
+    router->route_count = 0;
+
+    /* Traverse all method tries */
+    for (int i = 0; i < SF_METHOD_COUNT; i++) {
+        sf_rebuild_index_node(router, router->method_tries[i]);
+    }
+}
+
+/* ============================================================================
+ * Binary Serialization (Route Caching)
+ *
+ * Binary format for fast loading:
+ * - Header: "SFRC" (4) + version (1) + flags (1) + route_count (4) + reserved (6) = 16 bytes
+ * - For each method trie: serialized node tree
+ * - Node: type (1) + flags (1) + optional data based on flags
+ * ============================================================================ */
+
+#define SF_CACHE_MAGIC "SFRC"
+#define SF_CACHE_VERSION 1
+
+/* Node flags for binary format */
+#define SF_FLAG_TERMINAL        (1 << 0)
+#define SF_FLAG_HAS_SEGMENT     (1 << 1)
+#define SF_FLAG_HAS_PARAM_NAME  (1 << 2)
+#define SF_FLAG_HAS_CONSTRAINT  (1 << 3)
+#define SF_FLAG_HAS_STATIC      (1 << 4)
+#define SF_FLAG_HAS_PARAM       (1 << 5)
+#define SF_FLAG_HAS_OPTIONAL    (1 << 6)
+#define SF_FLAG_HAS_WILDCARD    (1 << 7)
+
+/* Binary buffer writer helpers */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t capacity;
+} sf_write_buffer;
+
+static void sf_buf_init(sf_write_buffer *buf, size_t initial_capacity)
+{
+    buf->data = emalloc(initial_capacity);
+    buf->len = 0;
+    buf->capacity = initial_capacity;
+}
+
+static void sf_buf_ensure(sf_write_buffer *buf, size_t need)
+{
+    if (buf->len + need > buf->capacity) {
+        while (buf->len + need > buf->capacity) {
+            buf->capacity *= 2;
+        }
+        buf->data = erealloc(buf->data, buf->capacity);
+    }
+}
+
+static void sf_buf_write_u8(sf_write_buffer *buf, uint8_t val)
+{
+    sf_buf_ensure(buf, 1);
+    buf->data[buf->len++] = val;
+}
+
+static void sf_buf_write_u16(sf_write_buffer *buf, uint16_t val)
+{
+    sf_buf_ensure(buf, 2);
+    buf->data[buf->len++] = (val >> 8) & 0xFF;
+    buf->data[buf->len++] = val & 0xFF;
+}
+
+static void sf_buf_write_u32(sf_write_buffer *buf, uint32_t val)
+{
+    sf_buf_ensure(buf, 4);
+    buf->data[buf->len++] = (val >> 24) & 0xFF;
+    buf->data[buf->len++] = (val >> 16) & 0xFF;
+    buf->data[buf->len++] = (val >> 8) & 0xFF;
+    buf->data[buf->len++] = val & 0xFF;
+}
+
+static void sf_buf_write_bytes(sf_write_buffer *buf, const char *data, size_t len)
+{
+    sf_buf_ensure(buf, len);
+    memcpy(buf->data + buf->len, data, len);
+    buf->len += len;
+}
+
+static void sf_buf_write_string(sf_write_buffer *buf, zend_string *str)
+{
+    if (str && ZSTR_LEN(str) > 0) {
+        uint16_t len = (uint16_t)(ZSTR_LEN(str) > 65535 ? 65535 : ZSTR_LEN(str));
+        sf_buf_write_u16(buf, len);
+        sf_buf_write_bytes(buf, ZSTR_VAL(str), len);
+    } else {
+        sf_buf_write_u16(buf, 0);
+    }
+}
+
+/* Binary buffer reader helpers */
+typedef struct {
+    const char *data;
+    size_t len;
+    size_t pos;
+} sf_read_buffer;
+
+static zend_bool sf_buf_read_u8(sf_read_buffer *buf, uint8_t *val)
+{
+    if (buf->pos + 1 > buf->len) return 0;
+    *val = (uint8_t)buf->data[buf->pos++];
+    return 1;
+}
+
+static zend_bool sf_buf_read_u16(sf_read_buffer *buf, uint16_t *val)
+{
+    if (buf->pos + 2 > buf->len) return 0;
+    *val = ((uint8_t)buf->data[buf->pos] << 8) | (uint8_t)buf->data[buf->pos + 1];
+    buf->pos += 2;
+    return 1;
+}
+
+static zend_bool sf_buf_read_u32(sf_read_buffer *buf, uint32_t *val)
+{
+    if (buf->pos + 4 > buf->len) return 0;
+    *val = ((uint8_t)buf->data[buf->pos] << 24) |
+           ((uint8_t)buf->data[buf->pos + 1] << 16) |
+           ((uint8_t)buf->data[buf->pos + 2] << 8) |
+           (uint8_t)buf->data[buf->pos + 3];
+    buf->pos += 4;
+    return 1;
+}
+
+static zend_string *sf_buf_read_string(sf_read_buffer *buf)
+{
+    uint16_t len;
+    if (!sf_buf_read_u16(buf, &len)) return NULL;
+    if (len == 0) return NULL;
+    if (buf->pos + len > buf->len) return NULL;
+    zend_string *str = zend_string_init(buf->data + buf->pos, len, 0);
+    buf->pos += len;
+    return str;
+}
+
+/* Serialize route to binary */
+static void sf_serialize_route_bin(sf_write_buffer *buf, sf_route *route)
+{
+    /* URI */
+    sf_buf_write_string(buf, route->uri);
+
+    /* Name */
+    sf_buf_write_string(buf, route->name);
+
+    /* Handler - only serialize if it's a string (Controller@method) */
+    if (!Z_ISUNDEF(route->handler) && Z_TYPE(route->handler) == IS_STRING) {
+        sf_buf_write_u8(buf, 1); /* String handler */
+        sf_buf_write_string(buf, Z_STR(route->handler));
+    } else if (!Z_ISUNDEF(route->handler) && Z_TYPE(route->handler) == IS_ARRAY) {
+        /* Array handler [class, method] - serialize as "class::method" */
+        zval *cls = zend_hash_index_find(Z_ARRVAL(route->handler), 0);
+        zval *mtd = zend_hash_index_find(Z_ARRVAL(route->handler), 1);
+        if (cls && mtd && Z_TYPE_P(cls) == IS_STRING && Z_TYPE_P(mtd) == IS_STRING) {
+            sf_buf_write_u8(buf, 2); /* Array handler */
+            sf_buf_write_string(buf, Z_STR_P(cls));
+            sf_buf_write_string(buf, Z_STR_P(mtd));
+        } else {
+            sf_buf_write_u8(buf, 0); /* Cannot serialize */
+        }
+    } else {
+        sf_buf_write_u8(buf, 0); /* No serializable handler (closure) */
+    }
+
+    /* Method */
+    sf_buf_write_u8(buf, (uint8_t)route->method);
+
+    /* Middleware */
+    sf_buf_write_u16(buf, route->middleware_count);
+    sf_middleware_entry *mw = route->middleware_head;
+    while (mw) {
+        sf_buf_write_string(buf, mw->name);
+        mw = mw->next;
+    }
+
+    /* Wheres (constraints) */
+    uint16_t where_count = route->wheres ? zend_hash_num_elements(route->wheres) : 0;
+    sf_buf_write_u16(buf, where_count);
+    if (route->wheres) {
+        zend_string *key;
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(route->wheres, key, val) {
+            if (key) {
+                sf_param_constraint *c = (sf_param_constraint *)Z_PTR_P(val);
+                sf_buf_write_string(buf, key);
+                sf_buf_write_string(buf, c->pattern);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    /* Defaults */
+    uint16_t default_count = route->defaults ? zend_hash_num_elements(route->defaults) : 0;
+    sf_buf_write_u16(buf, default_count);
+    if (route->defaults) {
+        zend_string *key;
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(route->defaults, key, val) {
+            if (key) {
+                sf_buf_write_string(buf, key);
+                /* Serialize value as string */
+                zend_string *str_val = zval_get_string(val);
+                sf_buf_write_string(buf, str_val);
+                zend_string_release(str_val);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    /* Domain */
+    sf_buf_write_string(buf, route->domain);
+
+    /* Is fallback */
+    sf_buf_write_u8(buf, route->is_fallback ? 1 : 0);
+}
+
+/* Serialize trie node recursively to binary */
+static void sf_serialize_node_bin(sf_write_buffer *buf, sf_trie_node *node)
 {
     if (!node) {
-        smart_str_appendc(buf, 'N'); /* Null marker */
+        sf_buf_write_u8(buf, 0xFF); /* Null marker */
         return;
     }
 
-    /* Node type */
-    smart_str_appendc(buf, 'T');
-    smart_str_append_unsigned(buf, node->type);
-    smart_str_appendc(buf, ':');
+    /* Build flags */
+    uint8_t flags = 0;
+    if (node->is_terminal && node->route) flags |= SF_FLAG_TERMINAL;
+    if (node->segment) flags |= SF_FLAG_HAS_SEGMENT;
+    if (node->param_name) flags |= SF_FLAG_HAS_PARAM_NAME;
+    if (node->constraint) flags |= SF_FLAG_HAS_CONSTRAINT;
+    if (node->static_children && zend_hash_num_elements(node->static_children) > 0) {
+        flags |= SF_FLAG_HAS_STATIC;
+    }
+    if (node->param_child) flags |= SF_FLAG_HAS_PARAM;
+    if (node->optional_child) flags |= SF_FLAG_HAS_OPTIONAL;
+    if (node->wildcard_child) flags |= SF_FLAG_HAS_WILDCARD;
+
+    /* Write type and flags */
+    sf_buf_write_u8(buf, (uint8_t)node->type);
+    sf_buf_write_u8(buf, flags);
 
     /* Segment */
-    if (node->segment) {
-        smart_str_appendc(buf, 'S');
-        smart_str_append_unsigned(buf, ZSTR_LEN(node->segment));
-        smart_str_appendc(buf, ':');
-        smart_str_append(buf, node->segment);
-    } else {
-        smart_str_appendc(buf, 's');
+    if (flags & SF_FLAG_HAS_SEGMENT) {
+        sf_buf_write_string(buf, node->segment);
     }
 
-    /* Parameter name */
-    if (node->param_name) {
-        smart_str_appendc(buf, 'P');
-        smart_str_append_unsigned(buf, ZSTR_LEN(node->param_name));
-        smart_str_appendc(buf, ':');
-        smart_str_append(buf, node->param_name);
-    } else {
-        smart_str_appendc(buf, 'p');
+    /* Param name */
+    if (flags & SF_FLAG_HAS_PARAM_NAME) {
+        sf_buf_write_string(buf, node->param_name);
     }
 
-    /* Terminal flag and route */
-    if (node->is_terminal && node->route) {
-        smart_str_appendc(buf, 'R');
-        /* Serialize route (simplified - just essential data) */
-        smart_str_append_unsigned(buf, ZSTR_LEN(node->route->uri));
-        smart_str_appendc(buf, ':');
-        smart_str_append(buf, node->route->uri);
-        smart_str_appendc(buf, ':');
-        if (node->route->name) {
-            smart_str_append_unsigned(buf, ZSTR_LEN(node->route->name));
-            smart_str_appendc(buf, ':');
-            smart_str_append(buf, node->route->name);
-        } else {
-            smart_str_appendc(buf, '0');
-            smart_str_appendc(buf, ':');
-        }
-    } else {
-        smart_str_appendc(buf, 'r');
+    /* Constraint pattern */
+    if (flags & SF_FLAG_HAS_CONSTRAINT) {
+        sf_buf_write_string(buf, node->constraint->pattern);
     }
 
-    /* Static children count */
-    uint32_t child_count = node->static_children ?
-        zend_hash_num_elements(node->static_children) : 0;
-    smart_str_appendc(buf, 'C');
-    smart_str_append_unsigned(buf, child_count);
-    smart_str_appendc(buf, ':');
+    /* Route (if terminal) */
+    if (flags & SF_FLAG_TERMINAL) {
+        sf_serialize_route_bin(buf, node->route);
+    }
 
-    /* Serialize static children */
-    if (node->static_children) {
+    /* Static children */
+    if (flags & SF_FLAG_HAS_STATIC) {
+        uint16_t count = (uint16_t)zend_hash_num_elements(node->static_children);
+        sf_buf_write_u16(buf, count);
         zend_string *key;
         zval *child_zv;
         ZEND_HASH_FOREACH_STR_KEY_VAL(node->static_children, key, child_zv) {
             if (key) {
-                smart_str_append_unsigned(buf, ZSTR_LEN(key));
-                smart_str_appendc(buf, ':');
-                smart_str_append(buf, key);
-                sf_serialize_node((sf_trie_node *)Z_PTR_P(child_zv), buf);
+                sf_buf_write_string(buf, key);
+                sf_serialize_node_bin(buf, (sf_trie_node *)Z_PTR_P(child_zv));
             }
         } ZEND_HASH_FOREACH_END();
     }
 
     /* Param child */
-    sf_serialize_node(node->param_child, buf);
+    if (flags & SF_FLAG_HAS_PARAM) {
+        sf_serialize_node_bin(buf, node->param_child);
+    }
 
     /* Optional child */
-    sf_serialize_node(node->optional_child, buf);
+    if (flags & SF_FLAG_HAS_OPTIONAL) {
+        sf_serialize_node_bin(buf, node->optional_child);
+    }
 
     /* Wildcard child */
-    sf_serialize_node(node->wildcard_child, buf);
+    if (flags & SF_FLAG_HAS_WILDCARD) {
+        sf_serialize_node_bin(buf, node->wildcard_child);
+    }
+}
+
+/* Deserialize route from binary */
+static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
+{
+    sf_route *route = sf_route_create();
+    if (!route) return NULL;
+
+    /* URI */
+    route->uri = sf_buf_read_string(buf);
+
+    /* Name */
+    route->name = sf_buf_read_string(buf);
+
+    /* Handler */
+    uint8_t handler_type;
+    if (!sf_buf_read_u8(buf, &handler_type)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+
+    if (handler_type == 1) {
+        /* String handler */
+        zend_string *handler_str = sf_buf_read_string(buf);
+        if (handler_str) {
+            ZVAL_STR(&route->handler, handler_str);
+        }
+    } else if (handler_type == 2) {
+        /* Array handler [class, method] */
+        zend_string *cls = sf_buf_read_string(buf);
+        zend_string *mtd = sf_buf_read_string(buf);
+        if (cls && mtd) {
+            array_init(&route->handler);
+            add_next_index_str(&route->handler, cls);
+            add_next_index_str(&route->handler, mtd);
+        } else {
+            if (cls) zend_string_release(cls);
+            if (mtd) zend_string_release(mtd);
+        }
+    }
+
+    /* Method */
+    uint8_t method;
+    if (!sf_buf_read_u8(buf, &method)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    route->method = (sf_http_method)method;
+
+    /* Middleware */
+    uint16_t mw_count;
+    if (!sf_buf_read_u16(buf, &mw_count)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    for (uint16_t i = 0; i < mw_count; i++) {
+        zend_string *mw_name = sf_buf_read_string(buf);
+        if (mw_name) {
+            sf_route_add_middleware(route, mw_name, NULL);
+            zend_string_release(mw_name);
+        }
+    }
+
+    /* Wheres */
+    uint16_t where_count;
+    if (!sf_buf_read_u16(buf, &where_count)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    for (uint16_t i = 0; i < where_count; i++) {
+        zend_string *param = sf_buf_read_string(buf);
+        zend_string *pattern = sf_buf_read_string(buf);
+        if (param && pattern) {
+            sf_route_set_where(route, param, pattern);
+        }
+        if (param) zend_string_release(param);
+        if (pattern) zend_string_release(pattern);
+    }
+
+    /* Defaults */
+    uint16_t default_count;
+    if (!sf_buf_read_u16(buf, &default_count)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    for (uint16_t i = 0; i < default_count; i++) {
+        zend_string *key = sf_buf_read_string(buf);
+        zend_string *val_str = sf_buf_read_string(buf);
+        if (key && val_str) {
+            zval val;
+            ZVAL_STR(&val, val_str);
+            sf_route_set_default(route, key, &val);
+            /* val_str is now owned by defaults table */
+        } else {
+            if (val_str) zend_string_release(val_str);
+        }
+        if (key) zend_string_release(key);
+    }
+
+    /* Domain */
+    zend_string *domain = sf_buf_read_string(buf);
+    if (domain) {
+        sf_route_set_domain(route, domain);
+        zend_string_release(domain);
+    }
+
+    /* Is fallback */
+    uint8_t is_fallback;
+    if (!sf_buf_read_u8(buf, &is_fallback)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    route->is_fallback = is_fallback ? 1 : 0;
+
+    return route;
+}
+
+/* Deserialize trie node recursively from binary */
+static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
+{
+    uint8_t type;
+    if (!sf_buf_read_u8(buf, &type)) return NULL;
+
+    /* Check for null marker */
+    if (type == 0xFF) return NULL;
+
+    uint8_t flags;
+    if (!sf_buf_read_u8(buf, &flags)) return NULL;
+
+    sf_trie_node *node = sf_trie_node_create((sf_node_type)type);
+    if (!node) return NULL;
+
+    /* Segment */
+    if (flags & SF_FLAG_HAS_SEGMENT) {
+        node->segment = sf_buf_read_string(buf);
+    }
+
+    /* Param name */
+    if (flags & SF_FLAG_HAS_PARAM_NAME) {
+        node->param_name = sf_buf_read_string(buf);
+    }
+
+    /* Constraint */
+    if (flags & SF_FLAG_HAS_CONSTRAINT) {
+        zend_string *pattern = sf_buf_read_string(buf);
+        if (pattern && node->param_name) {
+            node->constraint = sf_constraint_create(node->param_name);
+            if (node->constraint) {
+                sf_constraint_set_pattern(node->constraint, pattern);
+            }
+            zend_string_release(pattern);
+        } else if (pattern) {
+            zend_string_release(pattern);
+        }
+    }
+
+    /* Route */
+    if (flags & SF_FLAG_TERMINAL) {
+        node->route = sf_deserialize_route_bin(buf);
+        node->is_terminal = node->route ? 1 : 0;
+    }
+
+    /* Static children */
+    if (flags & SF_FLAG_HAS_STATIC) {
+        uint16_t count;
+        if (!sf_buf_read_u16(buf, &count)) {
+            sf_trie_node_destroy(node);
+            return NULL;
+        }
+
+        ALLOC_HASHTABLE(node->static_children);
+        zend_hash_init(node->static_children, count, NULL, NULL, 0);
+
+        for (uint16_t i = 0; i < count; i++) {
+            zend_string *key = sf_buf_read_string(buf);
+            sf_trie_node *child = sf_deserialize_node_bin(buf);
+            if (key && child) {
+                child->parent = node;
+                child->depth = node->depth + 1;
+                zval zv;
+                ZVAL_PTR(&zv, child);
+                zend_hash_add(node->static_children, key, &zv);
+            }
+            if (key) zend_string_release(key);
+        }
+    }
+
+    /* Param child */
+    if (flags & SF_FLAG_HAS_PARAM) {
+        node->param_child = sf_deserialize_node_bin(buf);
+        if (node->param_child) {
+            node->param_child->parent = node;
+            node->param_child->depth = node->depth + 1;
+        }
+    }
+
+    /* Optional child */
+    if (flags & SF_FLAG_HAS_OPTIONAL) {
+        node->optional_child = sf_deserialize_node_bin(buf);
+        if (node->optional_child) {
+            node->optional_child->parent = node;
+            node->optional_child->depth = node->depth + 1;
+        }
+    }
+
+    /* Wildcard child */
+    if (flags & SF_FLAG_HAS_WILDCARD) {
+        node->wildcard_child = sf_deserialize_node_bin(buf);
+        if (node->wildcard_child) {
+            node->wildcard_child->parent = node;
+            node->wildcard_child->depth = node->depth + 1;
+        }
+    }
+
+    return node;
 }
 
 zend_string *sf_router_serialize(sf_router *router)
@@ -1870,44 +2334,103 @@ zend_string *sf_router_serialize(sf_router *router)
         return NULL;
     }
 
-    smart_str buf = {0};
+    sf_write_buffer buf;
+    sf_buf_init(&buf, 64 * 1024); /* Start with 64KB */
 
-    /* Magic header */
-    smart_str_appends(&buf, "SFRT"); /* SignalForge RouTer */
-    smart_str_appendc(&buf, 1); /* Version */
+    /* Header: magic (4) + version (1) + flags (1) + route_count (4) + reserved (6) = 16 bytes */
+    sf_buf_write_bytes(&buf, SF_CACHE_MAGIC, 4);
+    sf_buf_write_u8(&buf, SF_CACHE_VERSION);
+    sf_buf_write_u8(&buf, 0); /* flags - reserved */
+    sf_buf_write_u32(&buf, router->route_count);
+    /* 6 bytes reserved */
+    sf_buf_write_u16(&buf, 0);
+    sf_buf_write_u32(&buf, 0);
 
     SF_ROUTER_LOCK(router);
 
     /* Serialize each method trie */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
-        smart_str_appendc(&buf, 'M');
-        smart_str_append_unsigned(&buf, i);
-        smart_str_appendc(&buf, ':');
-        sf_serialize_node(router->method_tries[i], &buf);
+        sf_serialize_node_bin(&buf, router->method_tries[i]);
+    }
+
+    /* Serialize fallback route if exists */
+    if (router->fallback_route) {
+        sf_buf_write_u8(&buf, 1);
+        sf_serialize_route_bin(&buf, router->fallback_route);
+    } else {
+        sf_buf_write_u8(&buf, 0);
     }
 
     SF_ROUTER_UNLOCK(router);
 
-    smart_str_0(&buf);
-    return buf.s;
+    /* Create zend_string from buffer */
+    zend_string *result = zend_string_init(buf.data, buf.len, 0);
+    efree(buf.data);
+
+    return result;
 }
 
-/* Note: Full unserialization implementation would mirror serialization */
-/* This is a simplified placeholder - production would need complete impl */
 sf_router *sf_router_unserialize(const char *data, size_t len)
 {
-    if (!data || len < 5) {
+    if (!data || len < 16) {
         return NULL;
     }
 
-    /* Verify magic header */
-    if (memcmp(data, "SFRT", 4) != 0) {
+    sf_read_buffer buf = { data, len, 0 };
+
+    /* Verify header */
+    if (memcmp(data, SF_CACHE_MAGIC, 4) != 0) {
+        php_error_docref(NULL, E_WARNING, "Invalid route cache: bad magic");
+        return NULL;
+    }
+    buf.pos = 4;
+
+    uint8_t version;
+    if (!sf_buf_read_u8(&buf, &version) || version != SF_CACHE_VERSION) {
+        php_error_docref(NULL, E_WARNING, "Invalid route cache: version mismatch");
         return NULL;
     }
 
-    /* TODO: Implement full deserialization */
-    /* For now, return fresh router - caching should be handled at PHP level */
-    return sf_router_create();
+    /* Skip flags and route count and reserved */
+    buf.pos = 16;
+
+    /* Create router */
+    sf_router *router = emalloc(sizeof(sf_router));
+    if (!router) return NULL;
+
+    memset(router, 0, sizeof(sf_router));
+
+    /* Initialize named routes hash table */
+    ALLOC_HASHTABLE(router->named_routes);
+    zend_hash_init(router->named_routes, 64, NULL, NULL, 0);
+
+    /* Initialize all routes hash table */
+    ALLOC_HASHTABLE(router->all_routes);
+    zend_hash_init(router->all_routes, 128, NULL, NULL, 0);
+
+#ifdef ZTS
+    router->lock = tsrm_mutex_alloc();
+#endif
+
+    /* Deserialize each method trie */
+    for (int i = 0; i < SF_METHOD_COUNT; i++) {
+        router->method_tries[i] = sf_deserialize_node_bin(&buf);
+        if (!router->method_tries[i]) {
+            /* Create empty root node if deserialization failed */
+            router->method_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
+        }
+    }
+
+    /* Rebuild named routes index by traversing tries */
+    sf_router_rebuild_index(router);
+
+    /* Deserialize fallback route */
+    uint8_t has_fallback;
+    if (sf_buf_read_u8(&buf, &has_fallback) && has_fallback) {
+        router->fallback_route = sf_deserialize_route_bin(&buf);
+    }
+
+    return router;
 }
 
 zend_bool sf_router_cache_to_file(sf_router *router, const char *path)

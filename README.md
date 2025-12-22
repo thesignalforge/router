@@ -1,19 +1,13 @@
 # Signalforge Routing
 
-Finally, a PHP router that doesn't suck at scale.
-
-I got tired of watching Laravel's router choke on large route tables. The problem? It's regex all the way down. Every request iterates through your entire route collection, compiling and matching patterns until something sticks. With 500+ routes, you start feeling it. With 5000+, it's painful.
-
-So I wrote this. It's a native PHP extension that uses a radix trie instead of regex iteration. Match time is O(k) where k is the path length - completely independent of how many routes you have.
+A native PHP extension for HTTP routing using a radix trie.
 
 ## What's Different
 
 - **Trie-based matching** - routes are stored in a compressed prefix tree, not an array
 - **No regex during traversal** - constraints are only checked at terminal nodes
 - **Separate trees per HTTP method** - GET requests never touch POST routes
-- **Written in C** - because PHP userland has limits
-
-The API mirrors Laravel's router, so you can mostly drop it in without rewriting everything.
+- **Written in C** - native PHP extension, not userland code
 
 ## Requirements
 
@@ -85,8 +79,6 @@ No iteration. No regex compilation per-route. Just pointer traversal.
 
 ## API
 
-Everything you'd expect from Laravel's router:
-
 ```php
 // methods
 Router::get($uri, $handler)
@@ -112,23 +104,15 @@ Router::get('/posts/{page?}', $handler)->defaults('page', 1);
 Router::get('/users/{id}', $handler)->name('users.show');
 $url = Router::url('users.show', ['id' => 42]);  // /users/42
 
+// caching
+Router::cache('/path/to/cache.bin');
+Router::loadCache('/path/to/cache.bin');
+
 // fallback
 Router::fallback(fn() => abort(404));
 ```
 
 Check `examples/basic_usage.php` for more.
-
-## Performance
-
-Rough numbers on my machine (10k routes registered):
-
-| | Signalforge | Laravel |
-|---|---|---|
-| Static match | ~0.5μs | ~45μs |
-| Dynamic match | ~1.2μs | ~120μs |
-| Memory/route | ~800 bytes | ~4KB |
-
-The gap widens as route count increases. Laravel's O(n) vs our O(k).
 
 ## Thread Safety
 
@@ -139,15 +123,6 @@ Works with ZTS builds. Each request gets isolated state, and the trie is read-on
 - Routes should be registered at bootstrap, not runtime
 - Linux x86_64 is the primary target
 - Needs PCRE2 for constraint matching
-- Route caching is basic (works but could be better)
-
-## TODO
-
-Stuff I want to add eventually:
-- Shared memory caching (APCu/SHM)
-- SIMD for segment matching
-- Better serialization format
-- More constraint types built-in
 
 ## Structure
 
@@ -163,7 +138,3 @@ tests/                    - phpt tests
 ## License
 
 MIT
-
----
-
-Built by signalforger. Not affiliated with Laravel.
