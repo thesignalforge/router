@@ -104,6 +104,11 @@ Router::get('/posts/{page?}', $handler)->defaults('page', 1);
 Router::get('/users/{id}', $handler)->name('users.show');
 $url = Router::url('users.show', ['id' => 42]);  // /users/42
 
+// get route by name
+$route = Router::route('users.show');
+$uri = $route->getUri();        // /users/{id}
+$method = $route->getMethods(); // ['GET']
+
 // caching
 Router::cache('/path/to/cache.bin');
 Router::loadCache('/path/to/cache.bin');
