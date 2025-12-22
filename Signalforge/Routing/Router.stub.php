@@ -174,6 +174,14 @@ final class Router
     public static function has(string $name): bool {}
 
     /**
+     * Get a route by its name.
+     *
+     * @param string $name Route name
+     * @return Route|null The route object or null if not found
+     */
+    public static function route(string $name): ?Route {}
+
+    /**
      * Get all registered routes.
      *
      * @return Route[] Array of Route objects

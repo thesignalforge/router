@@ -527,6 +527,25 @@ PHP_METHOD(Signalforge_Routing_Router, has)
     RETURN_BOOL(sf_router_has_route(router, name));
 }
 
+PHP_METHOD(Signalforge_Routing_Router, route)
+{
+    zend_string *name;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_router *router = sf_get_global_router();
+    sf_route *route = sf_router_get_route(router, name);
+
+    if (!route) {
+        RETURN_NULL();
+    }
+
+    sf_route_object *obj = sf_wrap_route(route);
+    RETURN_OBJ(&obj->std);
+}
+
 PHP_METHOD(Signalforge_Routing_Router, getRoutes)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -1357,6 +1376,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_has, 0, 1, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_route, 0, 1, Signalforge\\Routing\\Route, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_getRoutes, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -1496,6 +1519,7 @@ static const zend_function_entry sf_router_methods[] = {
     PHP_ME(Signalforge_Routing_Router, fallback, arginfo_router_fallback, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, url, arginfo_router_url, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, has, arginfo_router_has, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, route, arginfo_router_route, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, getRoutes, arginfo_router_getRoutes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, flush, arginfo_router_flush, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, cache, arginfo_router_cache, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
