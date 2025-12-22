@@ -1,0 +1,20 @@
+// config.w32 - Windows build configuration for Signalforge Routing Extension
+
+ARG_ENABLE("signalforge_routing", "Enable Signalforge Routing support", "no");
+
+if (PHP_SIGNALFORGE_ROUTING != "no") {
+    // Check for PCRE2
+    if (CHECK_LIB("pcre2-8.lib", "signalforge_routing", PHP_SIGNALFORGE_ROUTING) &&
+        CHECK_HEADER_ADD_INCLUDE("pcre2.h", "CFLAGS_SIGNALFORGE_ROUTING", PHP_SIGNALFORGE_ROUTING + ";" + PHP_PHP_BUILD + "\\include\\pcre2")) {
+
+        AC_DEFINE("PCRE2_CODE_UNIT_WIDTH", 8, "PCRE2 code unit width");
+        AC_DEFINE("HAVE_SIGNALFORGE_ROUTING", 1, "Signalforge Routing support enabled");
+
+        EXTENSION("signalforge_routing", "signalforge_routing.c routing_trie.c", PHP_SIGNALFORGE_ROUTING_SHARED, "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+
+        PHP_INSTALL_HEADERS("ext/signalforge_routing", "signalforge_routing.h routing_trie.h");
+
+    } else {
+        WARNING("signalforge_routing not enabled; PCRE2 library not found");
+    }
+}
