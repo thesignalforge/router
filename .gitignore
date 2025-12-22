@@ -1,0 +1,45 @@
+# Build artifacts
+*.lo
+*.la
+*.o
+*.so
+*.dep
+.libs/
+modules/
+libs/
+autom4te.cache/
+
+# Configure output
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+configure
+configure~
+configure.ac
+libtool
+Makefile
+Makefile.fragments
+Makefile.objects
+
+# Build directory
+build/
+include/
+
+# Test artifacts
+run-tests.php
+php_test_results*.txt
+tests/*.diff
+tests/*.out
+tests/*.exp
+tests/*.log
+tests/*.sh
+tests/*.php
+tmp-php.ini
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~

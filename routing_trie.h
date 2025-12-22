@@ -328,17 +328,6 @@ typedef enum {
     SF_ERR_MEMORY            = 8
 } sf_error_code;
 
-/* Global error state (per-request) */
-ZEND_BEGIN_MODULE_GLOBALS(signalforge_routing)
-    sf_error_code last_error;
-    char *last_error_msg;
-    sf_router *global_router;
-ZEND_END_MODULE_GLOBALS(signalforge_routing)
-
-#ifdef ZTS
-#define SF_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(signalforge_routing, v)
-#else
-#define SF_G(v) (signalforge_routing_globals.v)
-#endif
+/* Global error state - defined in signalforge_routing.h */
 
 #endif /* SIGNALFORGE_ROUTING_TRIE_H */

@@ -73,9 +73,6 @@ if test "$PHP_SIGNALFORGE_ROUTING" != "no"; then
   PHP_ADD_INCLUDE($ext_srcdir)
 
   dnl Install headers for potential use by other extensions
-  PHP_INSTALL_HEADERS([ext/signalforge_routing], [
-    signalforge_routing.h
-    routing_trie.h
-  ])
+  PHP_INSTALL_HEADERS([ext/signalforge_routing], [signalforge_routing.h routing_trie.h])
 
 fi
