@@ -1327,6 +1327,28 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
  * ============================================================================ */
 
 /**
+ * Find terminal node through chain of optional children
+ * Used when path is exhausted but we may have optional params with defaults
+ */
+static sf_trie_node *sf_find_terminal_through_optionals(sf_trie_node *node)
+{
+    if (!node) {
+        return NULL;
+    }
+
+    if (node->is_terminal) {
+        return node;
+    }
+
+    /* Traverse through optional children to find terminal */
+    if (node->optional_child) {
+        return sf_find_terminal_through_optionals(node->optional_child);
+    }
+
+    return NULL;
+}
+
+/**
  * Internal recursive trie matching
  *
  * This is the core matching algorithm using pointer traversal.
@@ -1352,9 +1374,10 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
         if (node->is_terminal) {
             return node;
         }
-        /* Check optional parameter child */
-        if (node->optional_child && node->optional_child->is_terminal) {
-            return node->optional_child;
+        /* Check for terminal through chain of optional children */
+        sf_trie_node *terminal = sf_find_terminal_through_optionals(node->optional_child);
+        if (terminal) {
+            return terminal;
         }
         return NULL;
     }
