@@ -68,13 +68,27 @@ typedef enum {
     SF_NODE_ROOT           = 4   /* Root node marker */
 } sf_node_type;
 
+/*
+ * Specialized validator types for common constraint patterns.
+ * These bypass PCRE2 regex matching for significant performance gains.
+ */
+typedef enum {
+    SF_VALIDATOR_REGEX       = 0,   /* Custom regex - use PCRE2 (fallback) */
+    SF_VALIDATOR_NUMBER      = 1,   /* [0-9]+ - digits only */
+    SF_VALIDATOR_ALPHA       = 2,   /* [a-zA-Z]+ - letters only */
+    SF_VALIDATOR_ALPHANUMERIC= 3,   /* [a-zA-Z0-9]+ - letters and digits */
+    SF_VALIDATOR_SLUG        = 4,   /* [a-zA-Z0-9-_]+ - URL-safe slug */
+    SF_VALIDATOR_UUID        = 5,   /* UUID format (8-4-4-4-12 hex) */
+} sf_validator_type;
+
 /* Parameter constraint structure */
 typedef struct _sf_param_constraint {
     zend_string *name;              /* Parameter name */
     zend_string *pattern;           /* Original regex pattern */
-    pcre2_code *compiled_regex;     /* Compiled PCRE2 regex */
+    pcre2_code *compiled_regex;     /* Compiled PCRE2 regex (NULL if specialized) */
     pcre2_match_data *match_data;   /* Reusable match data */
     zval default_value;             /* Default value for optional params */
+    sf_validator_type validator;    /* Specialized validator type */
     zend_bool has_default;          /* Whether default is set */
     zend_bool is_optional;          /* Is this parameter optional */
 } sf_param_constraint;
