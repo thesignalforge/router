@@ -14,6 +14,12 @@
 #include "zend_smart_str.h"
 #include <pcre2.h>
 
+#ifdef ZTS
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+#endif
+
 /* Forward declarations */
 typedef struct _sf_trie_node sf_trie_node;
 typedef struct _sf_route sf_route;
@@ -139,7 +145,15 @@ struct _sf_router {
     uint32_t route_count;           /* Total route count */
 
 #ifdef ZTS
-    MUTEX_T lock;                   /* Thread safety lock */
+    /* Read-write lock for thread safety:
+     * - Read lock for matching, URL generation, route lookup (concurrent reads OK)
+     * - Write lock for route insertion, reset (exclusive access required)
+     */
+#ifdef _WIN32
+    SRWLOCK lock;                   /* Windows Slim Reader/Writer Lock */
+#else
+    pthread_rwlock_t lock;          /* POSIX read-write lock */
+#endif
 #endif
 };
 
@@ -302,12 +316,38 @@ void sf_route_dump(sf_route *route);
 
 /* ============================================================================
  * Thread Safety Macros
+ *
+ * Read-write locking strategy:
+ * - SF_ROUTER_RDLOCK: Acquire read lock for read-only operations that can
+ *   proceed concurrently (match, url, has_route, get_route, serialize)
+ * - SF_ROUTER_WRLOCK: Acquire write lock for mutating operations that need
+ *   exclusive access (reset, insert/add_route)
+ * - SF_ROUTER_UNLOCK: Release either lock type
  * ============================================================================ */
 
 #ifdef ZTS
-#define SF_ROUTER_LOCK(router)   tsrm_mutex_lock((router)->lock)
-#define SF_ROUTER_UNLOCK(router) tsrm_mutex_unlock((router)->lock)
+#ifdef _WIN32
+/* Windows SRWLOCK implementation */
+#define SF_ROUTER_RDLOCK(router)  AcquireSRWLockShared(&(router)->lock)
+#define SF_ROUTER_WRLOCK(router)  AcquireSRWLockExclusive(&(router)->lock)
+#define SF_ROUTER_UNLOCK_RD(router) ReleaseSRWLockShared(&(router)->lock)
+#define SF_ROUTER_UNLOCK_WR(router) ReleaseSRWLockExclusive(&(router)->lock)
 #else
+/* POSIX pthread_rwlock implementation */
+#define SF_ROUTER_RDLOCK(router)  pthread_rwlock_rdlock(&(router)->lock)
+#define SF_ROUTER_WRLOCK(router)  pthread_rwlock_wrlock(&(router)->lock)
+#define SF_ROUTER_UNLOCK_RD(router) pthread_rwlock_unlock(&(router)->lock)
+#define SF_ROUTER_UNLOCK_WR(router) pthread_rwlock_unlock(&(router)->lock)
+#endif
+/* Legacy macro for backward compatibility - defaults to write lock */
+#define SF_ROUTER_LOCK(router)   SF_ROUTER_WRLOCK(router)
+#define SF_ROUTER_UNLOCK(router) SF_ROUTER_UNLOCK_WR(router)
+#else
+/* Non-ZTS builds: no locking needed */
+#define SF_ROUTER_RDLOCK(router)
+#define SF_ROUTER_WRLOCK(router)
+#define SF_ROUTER_UNLOCK_RD(router)
+#define SF_ROUTER_UNLOCK_WR(router)
 #define SF_ROUTER_LOCK(router)
 #define SF_ROUTER_UNLOCK(router)
 #endif
