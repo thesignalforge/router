@@ -16,6 +16,22 @@
 #include "zend_smart_str.h"
 #include <string.h>
 
+/* File locking constants for HIGH-01 fix */
+#ifdef PHP_WIN32
+# include <io.h>
+# ifndef LOCK_SH
+#  define LOCK_SH 1
+# endif
+# ifndef LOCK_EX
+#  define LOCK_EX 2
+# endif
+# ifndef LOCK_UN
+#  define LOCK_UN 8
+# endif
+#else
+# include <sys/file.h>
+#endif
+
 /* ============================================================================
  * Memory Management - Trie Nodes
  * ============================================================================ */
@@ -78,31 +94,43 @@ void sf_trie_node_destroy_recursive(sf_trie_node *node)
         return;
     }
 
-    /* Destroy static children */
-    if (node->static_children) {
-        zval *child_zv;
-        ZEND_HASH_FOREACH_VAL(node->static_children, child_zv) {
-            sf_trie_node *child = (sf_trie_node *)Z_PTR_P(child_zv);
-            sf_trie_node_destroy_recursive(child);
-        } ZEND_HASH_FOREACH_END();
-    }
+    /*
+     * HIGH-02 fix: static_children hash table has a destructor (sf_ht_trie_node_dtor)
+     * that will call destroy_recursive on each child when zend_hash_destroy is called.
+     * Do NOT manually iterate here to avoid double-free.
+     * The destructor handles: static_children entries.
+     * We still manually handle: param_child, optional_child, wildcard_child
+     * (these are direct pointers, not in a hash table with destructor).
+     */
 
     /* Destroy parameter child */
     if (node->param_child) {
         sf_trie_node_destroy_recursive(node->param_child);
+        node->param_child = NULL;  /* Prevent double-free */
     }
 
     /* Destroy optional child */
     if (node->optional_child) {
         sf_trie_node_destroy_recursive(node->optional_child);
+        node->optional_child = NULL;  /* Prevent double-free */
     }
 
     /* Destroy wildcard child */
     if (node->wildcard_child) {
         sf_trie_node_destroy_recursive(node->wildcard_child);
+        node->wildcard_child = NULL;  /* Prevent double-free */
     }
 
     sf_trie_node_destroy(node);
+}
+
+/* HIGH-02 fix: Hash table destructor for static children to ensure proper cleanup */
+static void sf_ht_trie_node_dtor(zval *zv)
+{
+    sf_trie_node *node = (sf_trie_node *)Z_PTR_P(zv);
+    if (node) {
+        sf_trie_node_destroy_recursive(node);
+    }
 }
 
 /* ============================================================================
@@ -927,9 +955,13 @@ sf_uri_segment *sf_parse_uri(const char *uri, size_t len)
             }
 
             if (ptr >= end || *ptr != '}') {
+                /* MED-02 fix: Provide clear error message for malformed URI */
+                php_error_docref(NULL, E_WARNING,
+                    "Signalforge\\Routing: Unclosed parameter in URI at position %zu",
+                    (size_t)(param_start - uri));
                 efree(segment);
                 sf_uri_segments_destroy(head);
-                return NULL; /* Unclosed parameter */
+                return NULL;
             }
 
             size_t param_len = ptr - param_start;
@@ -1009,7 +1041,8 @@ static sf_trie_node *sf_trie_get_or_create_static_child(sf_trie_node *parent, ze
     /* Initialize children hash table if needed */
     if (!parent->static_children) {
         ALLOC_HASHTABLE(parent->static_children);
-        zend_hash_init(parent->static_children, SF_STATIC_CHILDREN_INITIAL_SIZE, NULL, NULL, 0);
+        /* HIGH-02 fix: Use destructor to ensure consistent cleanup */
+        zend_hash_init(parent->static_children, SF_STATIC_CHILDREN_INITIAL_SIZE, NULL, sf_ht_trie_node_dtor, 0);
     }
 
     /* Look for existing child */
@@ -1454,6 +1487,9 @@ void sf_router_begin_group(sf_router *router, sf_route_group *group)
         return;
     }
 
+    /* HIGH-04 fix: Acquire write lock for thread safety */
+    SF_ROUTER_WRLOCK(router);
+
     /* Link to parent group */
     group->parent = router->current_group;
 
@@ -1523,16 +1559,30 @@ void sf_router_begin_group(sf_router *router, sf_route_group *group)
     }
 
     router->current_group = group;
+
+    SF_ROUTER_UNLOCK_WR(router);
 }
 
 void sf_router_end_group(sf_router *router)
 {
-    if (!router || !router->current_group) {
+    if (!router) {
+        return;
+    }
+
+    /* HIGH-04 fix: Acquire write lock for thread safety */
+    SF_ROUTER_WRLOCK(router);
+
+    if (!router->current_group) {
+        SF_ROUTER_UNLOCK_WR(router);
         return;
     }
 
     sf_route_group *current = router->current_group;
     router->current_group = current->parent;
+
+    SF_ROUTER_UNLOCK_WR(router);
+
+    /* Destroy outside lock to avoid holding lock during memory deallocation */
     sf_route_group_destroy(current);
 }
 
@@ -2008,6 +2058,16 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
     const char *end = ptr + ZSTR_LEN(route->uri);
 
     while (ptr < end) {
+        /* MED-05 fix: Prevent unbounded URL growth */
+        if (url.s && ZSTR_LEN(url.s) > SF_MAX_URI_LENGTH) {
+            smart_str_free(&url);
+            SF_ROUTER_UNLOCK_RD(router);
+            php_error_docref(NULL, E_WARNING,
+                "Signalforge\\Routing: Generated URL exceeds maximum length of %d bytes",
+                SF_MAX_URI_LENGTH);
+            return NULL;
+        }
+
         if (*ptr == '{') {
             ptr++;
             const char *param_start = ptr;
@@ -2602,9 +2662,19 @@ static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
     return route;
 }
 
-/* Deserialize trie node recursively from binary */
-static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
+/* Maximum recursion depth for deserialization to prevent stack overflow from malicious cache files */
+#define SF_MAX_DESERIALIZE_DEPTH 128
+
+/* Internal recursive deserialization with depth tracking (CRIT-02 fix) */
+static sf_trie_node *sf_deserialize_node_bin_internal(sf_read_buffer *buf, int depth)
 {
+    /* Prevent stack overflow from malicious cache files */
+    if (depth > SF_MAX_DESERIALIZE_DEPTH) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Route cache deserialization exceeded maximum depth");
+        return NULL;
+    }
+
     uint8_t type;
     if (!sf_buf_read_u8(buf, &type)) return NULL;
 
@@ -2613,6 +2683,13 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
 
     uint8_t flags;
     if (!sf_buf_read_u8(buf, &flags)) return NULL;
+
+    /* Validate node type (HIGH-03 style fix for type enum) */
+    if (type > SF_NODE_ROOT) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Invalid node type in cache file");
+        return NULL;
+    }
 
     sf_trie_node *node = sf_trie_node_create((sf_node_type)type);
     if (!node) return NULL;
@@ -2633,11 +2710,15 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
         uint8_t validator_type = 0;
         sf_buf_read_u8(buf, &validator_type);
 
+        /* HIGH-03 fix: Validate validator type is within known range */
+        if (validator_type > SF_VALIDATOR_UUID) {
+            validator_type = SF_VALIDATOR_REGEX;  /* Fall back to regex for unknown types */
+        }
+
         if (pattern && node->param_name) {
             node->constraint = sf_constraint_create(node->param_name);
             if (node->constraint) {
                 sf_constraint_set_pattern(node->constraint, pattern);
-                /* Override with serialized validator type for consistency */
                 node->constraint->validator = (sf_validator_type)validator_type;
             }
             zend_string_release(pattern);
@@ -2661,24 +2742,34 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
         }
 
         ALLOC_HASHTABLE(node->static_children);
-        zend_hash_init(node->static_children, count, NULL, NULL, 0);
+        /* HIGH-02 fix: Use destructor to ensure children are freed on error cleanup */
+        zend_hash_init(node->static_children, count, NULL, sf_ht_trie_node_dtor, 0);
 
         for (uint16_t i = 0; i < count; i++) {
             zend_string *key = sf_buf_read_string(buf);
-            sf_trie_node *child = sf_deserialize_node_bin(buf);
+            sf_trie_node *child = sf_deserialize_node_bin_internal(buf, depth + 1);
             if (key && child) {
                 child->depth = node->depth + 1;
                 zval zv;
                 ZVAL_PTR(&zv, child);
                 zend_hash_add(node->static_children, key, &zv);
+            } else if (child) {
+                /* Key failed but child succeeded - free the orphaned child */
+                sf_trie_node_destroy_recursive(child);
             }
             if (key) zend_string_release(key);
+
+            /* HIGH-02 fix: If child deserialization failed, clean up and return */
+            if (!child && key) {
+                sf_trie_node_destroy_recursive(node);
+                return NULL;
+            }
         }
     }
 
     /* Param child */
     if (flags & SF_FLAG_HAS_PARAM) {
-        node->param_child = sf_deserialize_node_bin(buf);
+        node->param_child = sf_deserialize_node_bin_internal(buf, depth + 1);
         if (node->param_child) {
             node->param_child->depth = node->depth + 1;
         }
@@ -2686,7 +2777,7 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
 
     /* Optional child */
     if (flags & SF_FLAG_HAS_OPTIONAL) {
-        node->optional_child = sf_deserialize_node_bin(buf);
+        node->optional_child = sf_deserialize_node_bin_internal(buf, depth + 1);
         if (node->optional_child) {
             node->optional_child->depth = node->depth + 1;
         }
@@ -2694,13 +2785,19 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
 
     /* Wildcard child */
     if (flags & SF_FLAG_HAS_WILDCARD) {
-        node->wildcard_child = sf_deserialize_node_bin(buf);
+        node->wildcard_child = sf_deserialize_node_bin_internal(buf, depth + 1);
         if (node->wildcard_child) {
             node->wildcard_child->depth = node->depth + 1;
         }
     }
 
     return node;
+}
+
+/* Deserialize trie node recursively from binary (public wrapper) */
+static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
+{
+    return sf_deserialize_node_bin_internal(buf, 0);
 }
 
 zend_string *sf_router_serialize(sf_router *router)
@@ -2763,9 +2860,19 @@ zend_string *sf_router_serialize(sf_router *router)
     return result;
 }
 
+/* LOW-01 fix: Maximum cache file size (256 MB) to prevent memory exhaustion */
+#define SF_MAX_CACHE_SIZE (256 * 1024 * 1024)
+
 sf_router *sf_router_unserialize(const char *data, size_t len)
 {
     if (!data || len < 16) {
+        return NULL;
+    }
+
+    /* LOW-01 fix: Validate cache file size to prevent memory exhaustion */
+    if (len > SF_MAX_CACHE_SIZE) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Route cache exceeds maximum size of %d MB", SF_MAX_CACHE_SIZE / (1024 * 1024));
         return NULL;
     }
 
@@ -2773,14 +2880,16 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
 
     /* Verify header */
     if (memcmp(data, SF_CACHE_MAGIC, 4) != 0) {
-        php_error_docref(NULL, E_WARNING, "Invalid route cache: bad magic");
+        php_error_docref(NULL, E_WARNING, "Signalforge\\Routing: Invalid route cache - bad magic");
         return NULL;
     }
     buf.pos = 4;
 
     uint8_t version;
     if (!sf_buf_read_u8(&buf, &version) || version != SF_CACHE_VERSION) {
-        php_error_docref(NULL, E_WARNING, "Invalid route cache: version mismatch");
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Invalid route cache - version mismatch (expected %d, got %d)",
+            SF_CACHE_VERSION, version);
         return NULL;
     }
 
@@ -2844,7 +2953,16 @@ zend_bool sf_router_cache_to_file(sf_router *router, const char *path)
         return 0;
     }
 
+    /* HIGH-01 fix: Acquire exclusive lock to prevent concurrent access
+     * php_stream_lock returns 0 on success, < 0 on failure/not supported */
+    if (php_stream_lock(stream, LOCK_EX) < 0) {
+        /* Lock failed - proceed without locking (best effort) */
+    }
+
     size_t written = php_stream_write(stream, ZSTR_VAL(serialized), ZSTR_LEN(serialized));
+
+    /* Release lock and close stream */
+    php_stream_lock(stream, LOCK_UN);
     php_stream_close(stream);
     zend_string_release(serialized);
 
@@ -2863,7 +2981,16 @@ sf_router *sf_router_load_from_file(const char *path)
         return NULL;
     }
 
+    /* HIGH-01 fix: Acquire shared lock to prevent TOCTOU race conditions
+     * php_stream_lock returns 0 on success, < 0 on failure/not supported */
+    if (php_stream_lock(stream, LOCK_SH) < 0) {
+        /* Lock failed - proceed without locking (best effort) */
+    }
+
     zend_string *contents = php_stream_copy_to_mem(stream, PHP_STREAM_COPY_ALL, 0);
+
+    /* Release lock and close stream */
+    php_stream_lock(stream, LOCK_UN);
     php_stream_close(stream);
 
     if (!contents) {
@@ -2897,7 +3024,11 @@ sf_http_method sf_method_from_string(const char *method, size_t len)
         if (strncasecmp(method, "OPTIONS", 7) == 0) return SF_METHOD_OPTIONS;
     }
 
-    return SF_METHOD_GET; /* Default */
+    /* LOW-04 fix: Warn about unknown method instead of silent fallback */
+    php_error_docref(NULL, E_NOTICE,
+        "Signalforge\\Routing: Unknown HTTP method '%.*s', defaulting to GET",
+        (int)(len > 20 ? 20 : len), method);
+    return SF_METHOD_GET;
 }
 
 const char *sf_method_to_string(sf_http_method method)
@@ -2907,6 +3038,9 @@ const char *sf_method_to_string(sf_http_method method)
     };
 
     if (method >= SF_METHOD_COUNT) {
+        /* LOW-04 fix: Warn about invalid method value */
+        php_error_docref(NULL, E_NOTICE,
+            "Signalforge\\Routing: Invalid HTTP method value %d, defaulting to GET", method);
         return "GET";
     }
 
@@ -2953,9 +3087,18 @@ zend_string *sf_normalize_uri(const char *uri, size_t len, zend_bool strip_trail
     return normalized.s;
 }
 
+/* LOW-03 fix: Maximum depth for debug dump to prevent stack overflow */
+#define SF_MAX_DUMP_DEPTH 256
+
 void sf_trie_dump(sf_trie_node *node, int depth)
 {
     if (!node) {
+        return;
+    }
+
+    /* LOW-03 fix: Prevent stack overflow on deeply nested tries */
+    if (depth > SF_MAX_DUMP_DEPTH) {
+        php_printf("  ... (truncated at depth %d)\n", SF_MAX_DUMP_DEPTH);
         return;
     }
 
@@ -2964,9 +3107,13 @@ void sf_trie_dump(sf_trie_node *node, int depth)
         php_printf("  ");
     }
 
-    /* Node info */
+    /* Node info - validate type to prevent array out of bounds */
     const char *type_names[] = {"STATIC", "PARAM", "OPTIONAL", "WILDCARD", "ROOT"};
-    php_printf("[%s]", type_names[node->type]);
+    if (node->type <= SF_NODE_ROOT) {
+        php_printf("[%s]", type_names[node->type]);
+    } else {
+        php_printf("[UNKNOWN:%d]", node->type);
+    }
 
     if (node->segment) {
         php_printf(" segment='%s'", ZSTR_VAL(node->segment));
