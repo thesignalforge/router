@@ -139,17 +139,39 @@ sf_route *sf_route_create(void)
     return route;
 }
 
+/**
+ * Increment route reference count atomically.
+ *
+ * Uses atomic operations in ZTS builds to prevent race conditions when
+ * multiple threads access the same route simultaneously. In non-ZTS builds,
+ * we still use atomics as they are cheap on modern CPUs and provide
+ * consistency.
+ *
+ * Memory ordering: RELAXED is sufficient for increment since we only need
+ * the increment itself to be atomic; no other memory operations depend on it.
+ */
 void sf_route_addref(sf_route *route)
 {
     if (route) {
-        route->refcount++;
+        __atomic_add_fetch(&route->refcount, 1, __ATOMIC_RELAXED);
     }
 }
 
+/**
+ * Decrement route reference count atomically and destroy if zero.
+ *
+ * Memory ordering: ACQ_REL (acquire-release) is required because:
+ * - RELEASE: Ensures all previous writes to the route are visible before
+ *   the decrement, so another thread that sees refcount==0 sees a consistent state
+ * - ACQUIRE: If we get refcount==0, we need to see all writes from other threads
+ *   that released their references before we free the memory
+ */
 void sf_route_release(sf_route *route)
 {
-    if (route && --route->refcount == 0) {
-        sf_route_destroy(route);
+    if (route) {
+        if (__atomic_sub_fetch(&route->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+            sf_route_destroy(route);
+        }
     }
 }
 
@@ -468,7 +490,12 @@ sf_router *sf_router_create(void)
     router->route_count = 0;
 
 #ifdef ZTS
-    router->lock = tsrm_mutex_alloc();
+    /* Initialize read-write lock for thread-safe access */
+#ifdef _WIN32
+    InitializeSRWLock(&router->lock);
+#else
+    pthread_rwlock_init(&router->lock, NULL);
+#endif
 #endif
 
     return router;
@@ -506,9 +533,12 @@ void sf_router_destroy(sf_router *router)
     }
 
 #ifdef ZTS
-    if (router->lock) {
-        tsrm_mutex_free(router->lock);
-    }
+    /* Destroy read-write lock */
+#ifdef _WIN32
+    /* Windows SRWLOCK does not require explicit destruction */
+#else
+    pthread_rwlock_destroy(&router->lock);
+#endif
 #endif
 
     efree(router);
@@ -537,7 +567,8 @@ void sf_router_reset(sf_router *router)
         }
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Write lock: reset modifies router state */
+    SF_ROUTER_WRLOCK(router);
 
     /* Destroy old tries */
     for (i = 0; i < SF_METHOD_COUNT; i++) {
@@ -560,7 +591,7 @@ void sf_router_reset(sf_router *router)
     router->is_immutable = 0;
     router->route_count = 0;
 
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_WR(router);
 }
 
 /* ============================================================================
@@ -928,7 +959,8 @@ zend_bool sf_trie_insert(sf_router *router, sf_http_method method,
         return 0;
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Write lock: inserting routes modifies router state */
+    SF_ROUTER_WRLOCK(router);
 
     /* Handle ANY method - insert into all tries */
     if (method == SF_METHOD_ANY) {
@@ -936,7 +968,7 @@ zend_bool sf_trie_insert(sf_router *router, sf_http_method method,
             root = router->method_tries[i];
             if (!sf_trie_insert_segments(root, segments, route)) {
                 sf_uri_segments_destroy(segments);
-                SF_ROUTER_UNLOCK(router);
+                SF_ROUTER_UNLOCK_WR(router);
                 return 0;
             }
         }
@@ -945,7 +977,7 @@ zend_bool sf_trie_insert(sf_router *router, sf_http_method method,
         result = sf_trie_insert_segments(root, segments, route);
         if (!result) {
             sf_uri_segments_destroy(segments);
-            SF_ROUTER_UNLOCK(router);
+            SF_ROUTER_UNLOCK_WR(router);
             return 0;
         }
     }
@@ -965,7 +997,7 @@ zend_bool sf_trie_insert(sf_router *router, sf_http_method method,
     zend_hash_next_index_insert(router->all_routes, &rv);
     router->route_count++;
 
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_WR(router);
 
     return 1;
 }
@@ -1453,9 +1485,13 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
 
     /* 1. Try static children first */
     if (node->static_children) {
-        zend_string *seg_str = zend_string_init(seg_start, seg_len, 0);
-        zval *child_zv = zend_hash_find(node->static_children, seg_str);
-        zend_string_release(seg_str);
+        /*
+         * Use zend_hash_str_find() to avoid allocating a temporary zend_string
+         * on every segment lookup. This is a hot path called for every segment
+         * in the URI during matching, so avoiding the allocation provides a
+         * measurable performance improvement.
+         */
+        zval *child_zv = zend_hash_str_find(node->static_children, seg_start, seg_len);
 
         if (child_zv) {
             sf_trie_node *child = (sf_trie_node *)Z_PTR_P(child_zv);
@@ -1543,7 +1579,8 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
         return result;
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Read lock: matching is a read-only operation */
+    SF_ROUTER_RDLOCK(router);
 
     root = router->method_tries[method];
     matched_node = sf_trie_match_internal(root, uri, uri_len, result->params, 0);
@@ -1583,7 +1620,7 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
         }
     }
 
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_RD(router);
 
     return result;
 }
@@ -1716,17 +1753,18 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
         return NULL;
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Read lock: URL generation only reads router state */
+    SF_ROUTER_RDLOCK(router);
 
     zval *route_zv = zend_hash_find(router->named_routes, name);
     if (!route_zv) {
-        SF_ROUTER_UNLOCK(router);
+        SF_ROUTER_UNLOCK_RD(router);
         return NULL;
     }
 
     sf_route *route = (sf_route *)Z_PTR_P(route_zv);
     if (!route || !route->uri) {
-        SF_ROUTER_UNLOCK(router);
+        SF_ROUTER_UNLOCK_RD(router);
         return NULL;
     }
 
@@ -1756,8 +1794,11 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
                 param_len--;
             }
 
-            zend_string *param_name = zend_string_init(param_start, param_len, 0);
-            zval *param_val = params ? zend_hash_find(params, param_name) : NULL;
+            /*
+             * Use zend_hash_str_find() to avoid allocating temporary zend_strings
+             * for parameter lookups during URL generation.
+             */
+            zval *param_val = params ? zend_hash_str_find(params, param_start, param_len) : NULL;
 
             if (param_val) {
                 if (Z_TYPE_P(param_val) == IS_STRING) {
@@ -1770,15 +1811,14 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
             } else if (!is_optional) {
                 /* Required parameter missing - check defaults */
                 zval *default_val = route->defaults ?
-                    zend_hash_find(route->defaults, param_name) : NULL;
+                    zend_hash_str_find(route->defaults, param_start, param_len) : NULL;
                 if (default_val) {
                     zend_string *str_val = zval_get_string(default_val);
                     smart_str_append(&url, str_val);
                     zend_string_release(str_val);
                 } else {
-                    zend_string_release(param_name);
                     smart_str_free(&url);
-                    SF_ROUTER_UNLOCK(router);
+                    SF_ROUTER_UNLOCK_RD(router);
                     php_error_docref(NULL, E_WARNING,
                         "Signalforge\\Routing: Missing required parameter '%.*s' for route '%s'",
                         (int)param_len, param_start, ZSTR_VAL(name));
@@ -1786,7 +1826,6 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
                 }
             }
 
-            zend_string_release(param_name);
             ptr++; /* Skip } */
         } else {
             smart_str_appendc(&url, *ptr);
@@ -1795,7 +1834,7 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
     }
 
     smart_str_0(&url);
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_RD(router);
 
     return url.s;
 }
@@ -1806,9 +1845,10 @@ zend_bool sf_router_has_route(sf_router *router, zend_string *name)
         return 0;
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Read lock: checking route existence is read-only */
+    SF_ROUTER_RDLOCK(router);
     zend_bool exists = zend_hash_exists(router->named_routes, name);
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_RD(router);
 
     return exists;
 }
@@ -1821,7 +1861,8 @@ sf_route *sf_router_get_route(sf_router *router, zend_string *name)
         return NULL;
     }
 
-    SF_ROUTER_LOCK(router);
+    /* Read lock: getting route is read-only */
+    SF_ROUTER_RDLOCK(router);
     zval *route_zv = zend_hash_find(router->named_routes, name);
     if (route_zv) {
         route = (sf_route *)Z_PTR_P(route_zv);
@@ -1831,7 +1872,7 @@ sf_route *sf_router_get_route(sf_router *router, zend_string *name)
          * but that would require the caller to release it.
          */
     }
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_RD(router);
 
     return route;
 }
@@ -2446,13 +2487,14 @@ zend_string *sf_router_serialize(sf_router *router)
     sf_buf_write_u16(&buf, 0);
     sf_buf_write_u32(&buf, 0);
 
-    SF_ROUTER_LOCK(router);
+    /* Read lock: serialization only reads router state */
+    SF_ROUTER_RDLOCK(router);
 
     /* Serialize each method trie */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
         sf_serialize_node_bin(&buf, router->method_tries[i]);
         if (buf.failed) {
-            SF_ROUTER_UNLOCK(router);
+            SF_ROUTER_UNLOCK_RD(router);
             efree(buf.data);
             php_error_docref(NULL, E_WARNING,
                 "Signalforge\\Routing: Route cache serialization failed - buffer overflow");
@@ -2468,7 +2510,7 @@ zend_string *sf_router_serialize(sf_router *router)
         sf_buf_write_u8(&buf, 0);
     }
 
-    SF_ROUTER_UNLOCK(router);
+    SF_ROUTER_UNLOCK_RD(router);
 
     /* Check for buffer failure before creating result */
     if (buf.failed) {
