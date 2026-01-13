@@ -20,6 +20,25 @@
 #endif
 #endif
 
+/* ============================================================================
+ * Cache Line Optimization
+ *
+ * Modern x86/x64 CPUs have 64-byte cache lines. By aligning frequently-accessed
+ * structures to cache line boundaries and grouping hot fields together, we can
+ * minimize cache misses during trie traversal.
+ * ============================================================================ */
+
+#define SF_CACHE_LINE_SIZE 64
+
+/* Alignment attribute for cache-line aligned structures */
+#ifdef __GNUC__
+#define SF_CACHE_ALIGNED __attribute__((aligned(SF_CACHE_LINE_SIZE)))
+#elif defined(_MSC_VER)
+#define SF_CACHE_ALIGNED __declspec(align(SF_CACHE_LINE_SIZE))
+#else
+#define SF_CACHE_ALIGNED
+#endif
+
 /* Forward declarations */
 typedef struct _sf_trie_node sf_trie_node;
 typedef struct _sf_route sf_route;
@@ -91,27 +110,41 @@ struct _sf_route {
     uint32_t refcount;              /* Reference count */
 };
 
-/* Trie node structure */
+/*
+ * Trie node structure - cache-line optimized layout
+ *
+ * Fields are ordered to minimize cache misses during route matching:
+ * - First cache line (bytes 0-63): All fields accessed during trie traversal
+ * - Second cache line (bytes 64+): Cold fields only accessed during insertion/validation
+ *
+ * Hot path during matching accesses: static_children, param_child, optional_child,
+ * wildcard_child, is_terminal, route, param_name, type (in roughly that order)
+ */
 struct _sf_trie_node {
-    sf_node_type type;              /* Node type */
-    zend_string *segment;           /* Path segment (static) or empty for params */
-    zend_string *param_name;        /* Parameter name (for PARAM types) */
-    sf_param_constraint *constraint;/* Parameter constraint (owned) */
+    /* ===== HOT FIELDS - First cache line (64 bytes) ===== */
+    /* These fields are accessed on every node visit during matching */
 
-    /* Children storage - hash table for static, single pointer for param */
-    HashTable *static_children;     /* Static segment children {segment => node} */
-    sf_trie_node *param_child;      /* Single parameter child */
-    sf_trie_node *optional_child;   /* Single optional parameter child */
-    sf_trie_node *wildcard_child;   /* Single wildcard child */
+    HashTable *static_children;     /* Static segment children - checked first (8 bytes) */
+    sf_trie_node *param_child;      /* Required parameter child (8 bytes) */
+    sf_trie_node *optional_child;   /* Optional parameter child (8 bytes) */
+    sf_trie_node *wildcard_child;   /* Wildcard catch-all child (8 bytes) */
+    sf_route *route;                /* Route if terminal - accessed on match (8 bytes) */
+    zend_string *param_name;        /* Parameter name - accessed when capturing (8 bytes) */
+    sf_node_type type;              /* Node type enum (4 bytes) */
+    uint8_t is_terminal;            /* Terminal flag - checked on every node (1 byte) */
+    uint8_t _cache_line_pad[11];    /* Pad to exactly 64 bytes (11 bytes) */
+    /* Total: 64 bytes = exactly one cache line */
 
-    /* Terminal information */
-    sf_route *route;                /* Route if this is a terminal node */
-    zend_bool is_terminal;          /* Is this a terminal node */
+    /* ===== COLD FIELDS - Second cache line (bytes 64+) ===== */
+    /* These fields are only accessed during route registration or validation */
 
-    /* Tree navigation */
-    sf_trie_node *parent;           /* Parent node */
-    uint32_t depth;                 /* Depth in tree */
-};
+    zend_string *segment;           /* Path segment - only used during insertion (8 bytes) */
+    sf_param_constraint *constraint;/* Parameter constraint - post-match validation (8 bytes) */
+    sf_trie_node *parent;           /* Parent node - tree manipulation only (8 bytes) */
+    uint32_t depth;                 /* Depth in tree - insertion/debug only (4 bytes) */
+    uint8_t _cold_padding[4];       /* Padding for alignment (4 bytes) */
+    /* Total cold: 32 bytes */
+} SF_CACHE_ALIGNED;
 
 /* Match result structure */
 struct _sf_match_result {
