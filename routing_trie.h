@@ -313,6 +313,30 @@ void sf_route_dump(sf_route *route);
 #endif
 
 /* ============================================================================
+ * Configuration Constants
+ * ============================================================================ */
+
+/* Maximum URI length to prevent excessive memory allocation (8KB) */
+#define SF_MAX_URI_LENGTH 8192
+
+/* Maximum route name length */
+#define SF_MAX_ROUTE_NAME_LENGTH 256
+
+/* Maximum middleware count per route */
+#define SF_MAX_MIDDLEWARE_COUNT 100
+
+/* Maximum trie depth (prevents stack overflow in recursive functions) */
+#define SF_MAX_TRIE_DEPTH 64
+
+/* Initial hash table sizes */
+#define SF_NAMED_ROUTES_INITIAL_SIZE 64
+#define SF_ALL_ROUTES_INITIAL_SIZE 128
+#define SF_STATIC_CHILDREN_INITIAL_SIZE 8
+#define SF_CONSTRAINTS_INITIAL_SIZE 8
+#define SF_DEFAULTS_INITIAL_SIZE 8
+#define SF_PARAMS_INITIAL_SIZE 8
+
+/* ============================================================================
  * Error Codes
  * ============================================================================ */
 
@@ -325,7 +349,8 @@ typedef enum {
     SF_ERR_ROUTE_NOT_FOUND   = 5,
     SF_ERR_METHOD_NOT_ALLOWED= 6,
     SF_ERR_IMMUTABLE         = 7,
-    SF_ERR_MEMORY            = 8
+    SF_ERR_MEMORY            = 8,
+    SF_ERR_DEPTH_EXCEEDED    = 9
 } sf_error_code;
 
 /* Global error state - defined in signalforge_routing.h */

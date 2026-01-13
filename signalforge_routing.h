@@ -143,6 +143,7 @@ PHP_METHOD(Signalforge_Routing_Router, name);
 PHP_METHOD(Signalforge_Routing_Router, fallback);
 PHP_METHOD(Signalforge_Routing_Router, url);
 PHP_METHOD(Signalforge_Routing_Router, has);
+PHP_METHOD(Signalforge_Routing_Router, route);
 PHP_METHOD(Signalforge_Routing_Router, getRoutes);
 PHP_METHOD(Signalforge_Routing_Router, flush);
 PHP_METHOD(Signalforge_Routing_Router, cache);
