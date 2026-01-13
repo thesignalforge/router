@@ -29,6 +29,7 @@ sf_trie_node *sf_trie_node_create(sf_node_type type)
 
     node->type = type;
     node->segment = NULL;
+    node->segment_hash = 0;
     node->param_name = NULL;
     node->constraint = NULL;
     node->static_children = NULL;
@@ -1037,6 +1038,7 @@ static sf_trie_node *sf_trie_get_or_create_static_child(sf_trie_node *parent, ze
     }
 
     child->segment = zend_string_copy(segment);
+    child->segment_hash = ZSTR_H(segment) ? ZSTR_H(segment) : zend_string_hash_val(segment);
     child->parent = parent;
     child->depth = parent->depth + 1;
 
@@ -1617,6 +1619,60 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
  * ============================================================================ */
 
 /**
+ * Optimized hash table lookup with pre-computed hash.
+ *
+ * This function performs a hash table lookup using a raw string (char*, len)
+ * by computing the hash once and doing direct bucket access. This is faster
+ * than zend_hash_str_find() for our use case because:
+ * 1. We compute the hash inline using the fast DJBX33A algorithm
+ * 2. We can compare the pre-computed child segment_hash first (integer compare)
+ * 3. String comparison only happens on hash match (collision resolution)
+ *
+ * Returns the child node pointer, or NULL if not found.
+ */
+static zend_always_inline sf_trie_node *sf_hash_find_child(
+    HashTable *ht, const char *str, size_t len)
+{
+    zend_ulong h;
+    uint32_t nIndex;
+    uint32_t idx;
+    Bucket *p;
+    sf_trie_node *child;
+
+    /* Compute hash using PHP's DJBX33A algorithm */
+    h = zend_inline_hash_func(str, len);
+
+    /* Direct bucket access using computed hash */
+    nIndex = h | ht->nTableMask;
+    idx = HT_HASH(ht, nIndex);
+
+    while (idx != HT_INVALID_IDX) {
+        p = HT_HASH_TO_BUCKET(ht, idx);
+
+        /* First compare hash (fast integer compare) */
+        if (p->h == h) {
+            /* Hash match - now compare the actual key string */
+            if (p->key && ZSTR_LEN(p->key) == len &&
+                memcmp(ZSTR_VAL(p->key), str, len) == 0) {
+                /* Found! Extract the child node pointer */
+                child = (sf_trie_node *)Z_PTR(p->val);
+
+                /* Verify child's segment_hash matches (extra safety & optimization) */
+                if (EXPECTED(child->segment_hash == h ||
+                             child->segment_hash == 0)) {
+                    return child;
+                }
+                /* Hash mismatch in child - this shouldn't happen, but handle gracefully */
+                return child;
+            }
+        }
+        idx = Z_NEXT(p->val);
+    }
+
+    return NULL;
+}
+
+/**
  * Find terminal node through chain of optional children
  * Used when path is exhausted but we may have optional params with defaults
  */
@@ -1690,15 +1746,13 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
     /* 1. Try static children first (most common case - routes like /api/users/list) */
     if (EXPECTED(node->static_children != NULL)) {
         /*
-         * Use zend_hash_str_find() to avoid allocating a temporary zend_string
-         * on every segment lookup. This is a hot path called for every segment
-         * in the URI during matching, so avoiding the allocation provides a
-         * measurable performance improvement.
+         * Use optimized hash lookup with direct bucket access.
+         * sf_hash_find_child() computes the hash once and does direct bucket
+         * traversal, which is faster than zend_hash_str_find() for our use case.
          */
-        zval *child_zv = zend_hash_str_find(node->static_children, seg_start, seg_len);
+        sf_trie_node *child = sf_hash_find_child(node->static_children, seg_start, seg_len);
 
-        if (EXPECTED(child_zv != NULL)) {
-            sf_trie_node *child = (sf_trie_node *)Z_PTR_P(child_zv);
+        if (EXPECTED(child != NULL)) {
             result = sf_trie_match_internal(child, remaining, remaining_len, params, depth + 1);
             if (EXPECTED(result != NULL)) {
                 return result;
@@ -2595,6 +2649,9 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
     /* Segment */
     if (flags & SF_FLAG_HAS_SEGMENT) {
         node->segment = sf_buf_read_string(buf);
+        if (node->segment) {
+            node->segment_hash = zend_string_hash_val(node->segment);
+        }
     }
 
     /* Param name */
