@@ -168,7 +168,7 @@ static void sf_router_register_method(INTERNAL_FUNCTION_PARAMETERS, sf_http_meth
     if (!route) {
         zend_throw_exception(sf_routing_exception_ce,
             "Failed to register route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     /* Return Route object for chaining */
@@ -242,7 +242,7 @@ PHP_METHOD(Signalforge_Routing_Router, match)
     if (!result) {
         zend_throw_exception(sf_routing_exception_ce,
             "Match operation failed", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     /* Return MatchResult object */
@@ -268,7 +268,7 @@ PHP_METHOD(Signalforge_Routing_Router, group)
     if (!group) {
         zend_throw_exception(sf_routing_exception_ce,
             "Failed to create route group", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     /* Parse attributes */
@@ -334,7 +334,7 @@ PHP_METHOD(Signalforge_Routing_Router, group)
         sf_router_end_group(router);
         zend_throw_exception(sf_routing_exception_ce,
             "Group callback execution failed", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     zval_ptr_dtor(&retval);
@@ -478,13 +478,17 @@ PHP_METHOD(Signalforge_Routing_Router, fallback)
     if (!route) {
         zend_throw_exception(sf_routing_exception_ce,
             "Failed to create fallback route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     route->uri = zend_string_init("*", 1, 0);
     route->is_fallback = 1;
     ZVAL_COPY(&route->handler, handler);
 
+    /* Release old fallback route if exists to prevent memory leak */
+    if (router->fallback_route) {
+        sf_route_release(router->fallback_route);
+    }
     router->fallback_route = route;
 
     /* Return Route object for chaining */
@@ -1033,7 +1037,6 @@ PHP_METHOD(Signalforge_Routing_Route, withoutMiddleware)
 
     /* Filter middleware list */
     sf_middleware_entry *current = intern->route->middleware_head;
-    sf_middleware_entry *prev = NULL;
     sf_middleware_entry *new_head = NULL;
     sf_middleware_entry *new_tail = NULL;
 

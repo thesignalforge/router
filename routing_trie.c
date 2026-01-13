@@ -253,6 +253,18 @@ void sf_constraint_destroy(sf_param_constraint *constraint)
     efree(constraint);
 }
 
+/**
+ * HashTable destructor for sf_param_constraint pointers stored in wheres tables.
+ * Called when entries are removed or the hash table is destroyed.
+ */
+static void sf_constraint_hash_dtor(zval *zv)
+{
+    sf_param_constraint *constraint = (sf_param_constraint *)Z_PTR_P(zv);
+    if (constraint) {
+        sf_constraint_destroy(constraint);
+    }
+}
+
 zend_bool sf_constraint_set_pattern(sf_param_constraint *constraint, zend_string *pattern)
 {
     int errcode;
@@ -443,11 +455,11 @@ sf_router *sf_router_create(void)
 
     /* Initialize named routes hash table */
     ALLOC_HASHTABLE(router->named_routes);
-    zend_hash_init(router->named_routes, 64, NULL, NULL, 0);
+    zend_hash_init(router->named_routes, SF_NAMED_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
     /* Initialize all routes hash table */
     ALLOC_HASHTABLE(router->all_routes);
-    zend_hash_init(router->all_routes, 128, NULL, NULL, 0);
+    zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
     router->current_group = NULL;
     router->fallback_route = NULL;
@@ -504,25 +516,47 @@ void sf_router_destroy(sf_router *router)
 
 void sf_router_reset(sf_router *router)
 {
+    sf_trie_node *new_tries[SF_METHOD_COUNT] = {NULL};
+    int i;
+
     if (!router) {
         return;
     }
 
+    /* Pre-allocate new tries before destroying old ones for atomicity */
+    for (i = 0; i < SF_METHOD_COUNT; i++) {
+        new_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
+        if (!new_tries[i]) {
+            /* Allocation failed - clean up and abort */
+            for (int j = 0; j < i; j++) {
+                sf_trie_node_destroy(new_tries[j]);
+            }
+            php_error_docref(NULL, E_WARNING,
+                "Signalforge\\Routing: Failed to reset router - memory allocation failed");
+            return;
+        }
+    }
+
     SF_ROUTER_LOCK(router);
 
-    /* Destroy and recreate tries */
-    for (int i = 0; i < SF_METHOD_COUNT; i++) {
+    /* Destroy old tries */
+    for (i = 0; i < SF_METHOD_COUNT; i++) {
         if (router->method_tries[i]) {
             sf_trie_node_destroy_recursive(router->method_tries[i]);
         }
-        router->method_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
+        router->method_tries[i] = new_tries[i];
     }
 
     /* Clear hash tables */
     zend_hash_clean(router->named_routes);
     zend_hash_clean(router->all_routes);
 
-    router->fallback_route = NULL;
+    /* Release fallback route if exists */
+    if (router->fallback_route) {
+        sf_route_release(router->fallback_route);
+        router->fallback_route = NULL;
+    }
+
     router->is_immutable = 0;
     router->route_count = 0;
 
@@ -545,7 +579,7 @@ sf_match_result *sf_match_result_create(void)
     result->error = NULL;
 
     ALLOC_HASHTABLE(result->params);
-    zend_hash_init(result->params, 8, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(result->params, SF_PARAMS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
 
     return result;
 }
@@ -633,6 +667,13 @@ sf_uri_segment *sf_parse_uri(const char *uri, size_t len)
     sf_uri_segment *tail = NULL;
     const char *ptr = uri;
     const char *end = uri + len;
+
+    /* Validate URI length to prevent excessive memory allocation */
+    if (len > SF_MAX_URI_LENGTH) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: URI exceeds maximum length of %d bytes", SF_MAX_URI_LENGTH);
+        return NULL;
+    }
 
     /* Skip leading slash */
     if (ptr < end && *ptr == '/') {
@@ -745,7 +786,7 @@ static sf_trie_node *sf_trie_get_or_create_static_child(sf_trie_node *parent, ze
     /* Initialize children hash table if needed */
     if (!parent->static_children) {
         ALLOC_HASHTABLE(parent->static_children);
-        zend_hash_init(parent->static_children, 8, NULL, NULL, 0);
+        zend_hash_init(parent->static_children, SF_STATIC_CHILDREN_INITIAL_SIZE, NULL, NULL, 0);
     }
 
     /* Look for existing child */
@@ -1056,7 +1097,7 @@ void sf_route_set_where(sf_route *route, zend_string *param, zend_string *patter
     /* Initialize wheres hash table if needed */
     if (!route->wheres) {
         ALLOC_HASHTABLE(route->wheres);
-        zend_hash_init(route->wheres, 8, NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(route->wheres, SF_CONSTRAINTS_INITIAL_SIZE, NULL, sf_constraint_hash_dtor, 0);
     }
 
     /* Create constraint */
@@ -1085,7 +1126,7 @@ void sf_route_set_default(sf_route *route, zend_string *param, zval *value)
     /* Initialize defaults hash table if needed */
     if (!route->defaults) {
         ALLOC_HASHTABLE(route->defaults);
-        zend_hash_init(route->defaults, 8, NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(route->defaults, SF_DEFAULTS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
     }
 
     zval copy;
@@ -1126,6 +1167,15 @@ void sf_route_set_domain(sf_route *route, zend_string *domain)
                 while (ptr < end && *ptr != '}') {
                     ptr++;
                 }
+
+                /* Validate we found closing brace */
+                if (ptr >= end) {
+                    /* Unclosed parameter - treat remaining as literal */
+                    smart_str_appendc(&pattern, '{');
+                    smart_str_appendl(&pattern, param_start, end - param_start);
+                    break;
+                }
+
                 /* Check for optional marker */
                 size_t param_len = ptr - param_start;
                 zend_bool is_optional = 0;
@@ -1142,7 +1192,7 @@ void sf_route_set_domain(sf_route *route, zend_string *domain)
                     smart_str_appendl(&pattern, param_start, param_len);
                     smart_str_appends(&pattern, ">[^.]+)");
                 }
-                ptr++; /* Skip } */
+                ptr++; /* Skip } - now safe because we verified ptr < end above */
             } else if (*ptr == '.') {
                 smart_str_appends(&pattern, "\\.");
                 ptr++;
@@ -1765,19 +1815,25 @@ zend_bool sf_router_has_route(sf_router *router, zend_string *name)
 
 sf_route *sf_router_get_route(sf_router *router, zend_string *name)
 {
+    sf_route *route = NULL;
+
     if (!router || !name) {
         return NULL;
     }
 
     SF_ROUTER_LOCK(router);
     zval *route_zv = zend_hash_find(router->named_routes, name);
+    if (route_zv) {
+        route = (sf_route *)Z_PTR_P(route_zv);
+        /*
+         * Note: In ZTS builds, the caller should ensure the route remains
+         * valid after this call. For safety, we could add a reference here
+         * but that would require the caller to release it.
+         */
+    }
     SF_ROUTER_UNLOCK(router);
 
-    if (!route_zv) {
-        return NULL;
-    }
-
-    return (sf_route *)Z_PTR_P(route_zv);
+    return route;
 }
 
 /* ============================================================================
@@ -1857,34 +1913,74 @@ typedef struct {
     char *data;
     size_t len;
     size_t capacity;
+    zend_bool failed;  /* Track allocation failures */
 } sf_write_buffer;
+
+/* Maximum buffer size to prevent excessive memory allocation (64MB) */
+#define SF_MAX_BUFFER_SIZE (64 * 1024 * 1024)
+
+/* Initial serialization buffer size (64KB) */
+#define SF_INITIAL_BUFFER_SIZE (64 * 1024)
 
 static void sf_buf_init(sf_write_buffer *buf, size_t initial_capacity)
 {
     buf->data = emalloc(initial_capacity);
     buf->len = 0;
     buf->capacity = initial_capacity;
+    buf->failed = 0;
 }
 
 static void sf_buf_ensure(sf_write_buffer *buf, size_t need)
 {
-    if (buf->len + need > buf->capacity) {
-        while (buf->len + need > buf->capacity) {
-            buf->capacity *= 2;
-        }
-        buf->data = erealloc(buf->data, buf->capacity);
+    size_t new_capacity;
+    size_t required;
+
+    if (buf->failed) {
+        return;  /* Already in error state */
     }
+
+    /* Check for overflow in addition */
+    if (need > SIZE_MAX - buf->len) {
+        buf->failed = 1;
+        return;
+    }
+
+    required = buf->len + need;
+    if (required <= buf->capacity) {
+        return;  /* Already have enough space */
+    }
+
+    /* Check if required size exceeds maximum */
+    if (required > SF_MAX_BUFFER_SIZE) {
+        buf->failed = 1;
+        return;
+    }
+
+    /* Calculate new capacity with overflow protection */
+    new_capacity = buf->capacity;
+    while (new_capacity < required) {
+        if (new_capacity > SF_MAX_BUFFER_SIZE / 2) {
+            new_capacity = SF_MAX_BUFFER_SIZE;
+            break;
+        }
+        new_capacity *= 2;
+    }
+
+    buf->data = erealloc(buf->data, new_capacity);
+    buf->capacity = new_capacity;
 }
 
 static void sf_buf_write_u8(sf_write_buffer *buf, uint8_t val)
 {
     sf_buf_ensure(buf, 1);
+    if (buf->failed) return;
     buf->data[buf->len++] = val;
 }
 
 static void sf_buf_write_u16(sf_write_buffer *buf, uint16_t val)
 {
     sf_buf_ensure(buf, 2);
+    if (buf->failed) return;
     buf->data[buf->len++] = (val >> 8) & 0xFF;
     buf->data[buf->len++] = val & 0xFF;
 }
@@ -1892,6 +1988,7 @@ static void sf_buf_write_u16(sf_write_buffer *buf, uint16_t val)
 static void sf_buf_write_u32(sf_write_buffer *buf, uint32_t val)
 {
     sf_buf_ensure(buf, 4);
+    if (buf->failed) return;
     buf->data[buf->len++] = (val >> 24) & 0xFF;
     buf->data[buf->len++] = (val >> 16) & 0xFF;
     buf->data[buf->len++] = (val >> 8) & 0xFF;
@@ -1901,6 +1998,7 @@ static void sf_buf_write_u32(sf_write_buffer *buf, uint32_t val)
 static void sf_buf_write_bytes(sf_write_buffer *buf, const char *data, size_t len)
 {
     sf_buf_ensure(buf, len);
+    if (buf->failed) return;
     memcpy(buf->data + buf->len, data, len);
     buf->len += len;
 }
@@ -1969,7 +2067,7 @@ static void sf_serialize_route_bin(sf_write_buffer *buf, sf_route *route)
     /* Name */
     sf_buf_write_string(buf, route->name);
 
-    /* Handler - only serialize if it's a string (Controller@method) */
+    /* Handler - only serialize if it's a string or array callable */
     if (!Z_ISUNDEF(route->handler) && Z_TYPE(route->handler) == IS_STRING) {
         sf_buf_write_u8(buf, 1); /* String handler */
         sf_buf_write_string(buf, Z_STR(route->handler));
@@ -2330,12 +2428,14 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
 
 zend_string *sf_router_serialize(sf_router *router)
 {
+    zend_string *result;
+
     if (!router) {
         return NULL;
     }
 
     sf_write_buffer buf;
-    sf_buf_init(&buf, 64 * 1024); /* Start with 64KB */
+    sf_buf_init(&buf, SF_INITIAL_BUFFER_SIZE);
 
     /* Header: magic (4) + version (1) + flags (1) + route_count (4) + reserved (6) = 16 bytes */
     sf_buf_write_bytes(&buf, SF_CACHE_MAGIC, 4);
@@ -2351,6 +2451,13 @@ zend_string *sf_router_serialize(sf_router *router)
     /* Serialize each method trie */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
         sf_serialize_node_bin(&buf, router->method_tries[i]);
+        if (buf.failed) {
+            SF_ROUTER_UNLOCK(router);
+            efree(buf.data);
+            php_error_docref(NULL, E_WARNING,
+                "Signalforge\\Routing: Route cache serialization failed - buffer overflow");
+            return NULL;
+        }
     }
 
     /* Serialize fallback route if exists */
@@ -2363,8 +2470,16 @@ zend_string *sf_router_serialize(sf_router *router)
 
     SF_ROUTER_UNLOCK(router);
 
+    /* Check for buffer failure before creating result */
+    if (buf.failed) {
+        efree(buf.data);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Route cache serialization failed - buffer overflow");
+        return NULL;
+    }
+
     /* Create zend_string from buffer */
-    zend_string *result = zend_string_init(buf.data, buf.len, 0);
+    result = zend_string_init(buf.data, buf.len, 0);
     efree(buf.data);
 
     return result;
@@ -2402,11 +2517,11 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
 
     /* Initialize named routes hash table */
     ALLOC_HASHTABLE(router->named_routes);
-    zend_hash_init(router->named_routes, 64, NULL, NULL, 0);
+    zend_hash_init(router->named_routes, SF_NAMED_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
     /* Initialize all routes hash table */
     ALLOC_HASHTABLE(router->all_routes);
-    zend_hash_init(router->all_routes, 128, NULL, NULL, 0);
+    zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
 #ifdef ZTS
     router->lock = tsrm_mutex_alloc();
