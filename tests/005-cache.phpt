@@ -12,18 +12,18 @@ $cacheFile = sys_get_temp_dir() . '/sf_route_cache_test.bin';
 @unlink($cacheFile);
 
 // Register routes
-Router::get('/users', 'UserController@index')->name('users.index');
-Router::get('/users/{id}', 'UserController@show')
+Router::get('/users', [UserController::class, 'index'])->name('users.index');
+Router::get('/users/{id}', [UserController::class, 'show'])
     ->name('users.show')
     ->whereNumber('id');
-Router::post('/users', 'UserController@store')
+Router::post('/users', [UserController::class, 'store'])
     ->middleware(['auth', 'validate']);
-Router::get('/posts/{slug?}', 'PostController@show')
+Router::get('/posts/{slug?}', [PostController::class, 'show'])
     ->name('posts.show')
     ->defaults('slug', 'latest');
 
 Router::group(['prefix' => '/api', 'middleware' => ['api']], function() {
-    Router::get('/status', 'ApiController@status')->name('api.status');
+    Router::get('/status', [ApiController::class, 'status'])->name('api.status');
 });
 
 // Save to cache

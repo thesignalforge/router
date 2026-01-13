@@ -7,11 +7,11 @@ signalforge_routing
 use Signalforge\Routing\Router;
 
 // Register named routes
-Router::get('/users', 'UserController@index')->name('users.index');
-Router::get('/users/{id}', 'UserController@show')
+Router::get('/users', [UserController::class, 'index'])->name('users.index');
+Router::get('/users/{id}', [UserController::class, 'show'])
     ->name('users.show')
     ->whereNumber('id');
-Router::post('/users', 'UserController@store')
+Router::post('/users', [UserController::class, 'store'])
     ->name('users.store')
     ->middleware(['auth', 'validate']);
 
