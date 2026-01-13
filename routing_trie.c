@@ -29,7 +29,6 @@ sf_trie_node *sf_trie_node_create(sf_node_type type)
 
     node->type = type;
     node->segment = NULL;
-    node->segment_hash = 0;
     node->param_name = NULL;
     node->constraint = NULL;
     node->static_children = NULL;
@@ -38,7 +37,6 @@ sf_trie_node *sf_trie_node_create(sf_node_type type)
     node->wildcard_child = NULL;
     node->route = NULL;
     node->is_terminal = 0;
-    node->parent = NULL;
     node->depth = 0;
 
     return node;
@@ -120,15 +118,12 @@ sf_route *sf_route_create(void)
 
     route->uri = NULL;
     route->name = NULL;
-    route->action_namespace = NULL;
     ZVAL_UNDEF(&route->handler);
-    route->handler_prepared = 0;
     route->middleware_head = NULL;
     route->middleware_tail = NULL;
     route->middleware_count = 0;
     route->wheres = NULL;
     route->defaults = NULL;
-    ZVAL_UNDEF(&route->meta);
     route->method = SF_METHOD_GET;
     route->domain = NULL;
     route->domain_regex = NULL;
@@ -190,10 +185,6 @@ void sf_route_destroy(sf_route *route)
         zend_string_release(route->name);
     }
 
-    if (route->action_namespace) {
-        zend_string_release(route->action_namespace);
-    }
-
     if (!Z_ISUNDEF(route->handler)) {
         zval_ptr_dtor(&route->handler);
     }
@@ -208,10 +199,6 @@ void sf_route_destroy(sf_route *route)
     if (route->defaults) {
         zend_hash_destroy(route->defaults);
         FREE_HASHTABLE(route->defaults);
-    }
-
-    if (!Z_ISUNDEF(route->meta)) {
-        zval_ptr_dtor(&route->meta);
     }
 
     if (route->domain) {
@@ -1038,8 +1025,6 @@ static sf_trie_node *sf_trie_get_or_create_static_child(sf_trie_node *parent, ze
     }
 
     child->segment = zend_string_copy(segment);
-    child->segment_hash = ZSTR_H(segment) ? ZSTR_H(segment) : zend_string_hash_val(segment);
-    child->parent = parent;
     child->depth = parent->depth + 1;
 
     /* Add to parent's children */
@@ -1088,7 +1073,6 @@ static sf_trie_node *sf_trie_get_or_create_param_child(sf_trie_node *parent,
     }
 
     child->param_name = zend_string_copy(param_name);
-    child->parent = parent;
     child->depth = parent->depth + 1;
     *child_ptr = child;
 
@@ -1558,11 +1542,6 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
         return;
     }
 
-    /* Apply namespace */
-    if (group->namespace) {
-        route->action_namespace = zend_string_copy(group->namespace);
-    }
-
     /* Apply name prefix */
     if (group->name_prefix && route->name) {
         smart_str full_name = {0};
@@ -1655,15 +1634,7 @@ static zend_always_inline sf_trie_node *sf_hash_find_child(
             if (p->key && ZSTR_LEN(p->key) == len &&
                 memcmp(ZSTR_VAL(p->key), str, len) == 0) {
                 /* Found! Extract the child node pointer */
-                child = (sf_trie_node *)Z_PTR(p->val);
-
-                /* Verify child's segment_hash matches (extra safety & optimization) */
-                if (EXPECTED(child->segment_hash == h ||
-                             child->segment_hash == 0)) {
-                    return child;
-                }
-                /* Hash mismatch in child - this shouldn't happen, but handle gracefully */
-                return child;
+                return (sf_trie_node *)Z_PTR(p->val);
             }
         }
         idx = Z_NEXT(p->val);
@@ -2649,9 +2620,6 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
     /* Segment */
     if (flags & SF_FLAG_HAS_SEGMENT) {
         node->segment = sf_buf_read_string(buf);
-        if (node->segment) {
-            node->segment_hash = zend_string_hash_val(node->segment);
-        }
     }
 
     /* Param name */
@@ -2699,7 +2667,6 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
             zend_string *key = sf_buf_read_string(buf);
             sf_trie_node *child = sf_deserialize_node_bin(buf);
             if (key && child) {
-                child->parent = node;
                 child->depth = node->depth + 1;
                 zval zv;
                 ZVAL_PTR(&zv, child);
@@ -2713,7 +2680,6 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
     if (flags & SF_FLAG_HAS_PARAM) {
         node->param_child = sf_deserialize_node_bin(buf);
         if (node->param_child) {
-            node->param_child->parent = node;
             node->param_child->depth = node->depth + 1;
         }
     }
@@ -2722,7 +2688,6 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
     if (flags & SF_FLAG_HAS_OPTIONAL) {
         node->optional_child = sf_deserialize_node_bin(buf);
         if (node->optional_child) {
-            node->optional_child->parent = node;
             node->optional_child->depth = node->depth + 1;
         }
     }
@@ -2731,7 +2696,6 @@ static sf_trie_node *sf_deserialize_node_bin(sf_read_buffer *buf)
     if (flags & SF_FLAG_HAS_WILDCARD) {
         node->wildcard_child = sf_deserialize_node_bin(buf);
         if (node->wildcard_child) {
-            node->wildcard_child->parent = node;
             node->wildcard_child->depth = node->depth + 1;
         }
     }

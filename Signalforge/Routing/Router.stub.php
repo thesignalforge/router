@@ -23,7 +23,7 @@ final class Router
      * Register a GET route.
      *
      * @param string $uri The URI pattern (e.g., '/users/{id}')
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function get(string $uri, mixed $handler): Route {}
@@ -32,7 +32,7 @@ final class Router
      * Register a POST route.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function post(string $uri, mixed $handler): Route {}
@@ -41,7 +41,7 @@ final class Router
      * Register a PUT route.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function put(string $uri, mixed $handler): Route {}
@@ -50,7 +50,7 @@ final class Router
      * Register a PATCH route.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function patch(string $uri, mixed $handler): Route {}
@@ -59,7 +59,7 @@ final class Router
      * Register a DELETE route.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function delete(string $uri, mixed $handler): Route {}
@@ -68,7 +68,7 @@ final class Router
      * Register an OPTIONS route.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function options(string $uri, mixed $handler): Route {}
@@ -77,7 +77,7 @@ final class Router
      * Register a route for any HTTP method.
      *
      * @param string $uri The URI pattern
-     * @param mixed $handler Callable, closure, or 'Controller@method' string
+     * @param callable $handler Any PHP callable: [Controller::class, 'method'], closure, function name, etc.
      * @return Route The created route for method chaining
      */
     public static function any(string $uri, mixed $handler): Route {}
@@ -98,7 +98,6 @@ final class Router
      * Supported attributes:
      * - 'prefix': URI prefix for all routes in the group
      * - 'middleware': Array of middleware to apply
-     * - 'namespace': Controller namespace
      * - 'as': Route name prefix
      * - 'domain': Domain constraint
      *

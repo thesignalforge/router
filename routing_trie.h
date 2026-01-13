@@ -26,17 +26,27 @@
  * Modern x86/x64 CPUs have 64-byte cache lines. By aligning frequently-accessed
  * structures to cache line boundaries and grouping hot fields together, we can
  * minimize cache misses during trie traversal.
+ *
+ * Define SF_COMPACT_MODE at compile time to disable cache alignment and reduce
+ * memory usage at the cost of some performance:
+ *   make CFLAGS="-DSF_COMPACT_MODE"
  * ============================================================================ */
 
 #define SF_CACHE_LINE_SIZE 64
 
 /* Alignment attribute for cache-line aligned structures */
+#ifdef SF_COMPACT_MODE
+/* Compact mode: no alignment, smaller structs, higher memory efficiency */
+#define SF_CACHE_ALIGNED
+#else
+/* Performance mode: cache-line aligned for optimal CPU cache usage */
 #ifdef __GNUC__
 #define SF_CACHE_ALIGNED __attribute__((aligned(SF_CACHE_LINE_SIZE)))
 #elif defined(_MSC_VER)
 #define SF_CACHE_ALIGNED __declspec(align(SF_CACHE_LINE_SIZE))
 #else
 #define SF_CACHE_ALIGNED
+#endif
 #endif
 
 /* Forward declarations */
@@ -100,28 +110,24 @@ typedef struct _sf_middleware_entry {
     struct _sf_middleware_entry *next;
 } sf_middleware_entry;
 
-/* Route definition structure */
+/* Route definition structure - optimized for memory (152 bytes vs 256) */
 struct _sf_route {
     zend_string *uri;               /* Original URI pattern */
     zend_string *name;              /* Route name (nullable) */
-    zend_string *action_namespace;  /* Controller namespace */
     zval handler;                   /* Callable or controller@method string */
-    zend_fcall_info fci;            /* Prepared call info */
-    zend_fcall_info_cache fcc;      /* Prepared call cache */
-    zend_bool handler_prepared;     /* Whether fci/fcc are prepared */
     sf_middleware_entry *middleware_head; /* Linked list of middleware */
     sf_middleware_entry *middleware_tail;
-    uint32_t middleware_count;
     HashTable *wheres;              /* Parameter constraints {name => pattern} */
     HashTable *defaults;            /* Default parameter values */
-    zval meta;                      /* Additional metadata (array) */
-    sf_http_method method;          /* HTTP method */
     zend_string *domain;            /* Domain/subdomain constraint */
     pcre2_code *domain_regex;       /* Compiled domain regex */
-    uint32_t priority;              /* Route priority (lower = higher priority) */
-    zend_bool is_fallback;          /* Is this a fallback route */
     zend_object *php_object;        /* Associated PHP Route object */
+    uint32_t middleware_count;
+    uint32_t priority;              /* Route priority (lower = higher priority) */
     uint32_t refcount;              /* Reference count */
+    sf_http_method method;          /* HTTP method (4 bytes) */
+    uint8_t is_fallback;            /* Is this a fallback route */
+    uint8_t _padding[3];            /* Alignment padding */
 };
 
 /*
@@ -133,9 +139,13 @@ struct _sf_route {
  *
  * Hot path during matching accesses: static_children, param_child, optional_child,
  * wildcard_child, is_terminal, route, param_name, type (in roughly that order)
+ *
+ * Memory optimized: removed segment_hash (computed on-the-fly) and parent (never read)
+ *
+ * Compile with -DSF_COMPACT_MODE to disable cache alignment (saves ~40 bytes/node)
  */
 struct _sf_trie_node {
-    /* ===== HOT FIELDS - First cache line (64 bytes) ===== */
+    /* ===== HOT FIELDS ===== */
     /* These fields are accessed on every node visit during matching */
 
     HashTable *static_children;     /* Static segment children - checked first (8 bytes) */
@@ -146,19 +156,16 @@ struct _sf_trie_node {
     zend_string *param_name;        /* Parameter name - accessed when capturing (8 bytes) */
     sf_node_type type;              /* Node type enum (4 bytes) */
     uint8_t is_terminal;            /* Terminal flag - checked on every node (1 byte) */
+#ifndef SF_COMPACT_MODE
     uint8_t _cache_line_pad[11];    /* Pad to exactly 64 bytes (11 bytes) */
-    /* Total: 64 bytes = exactly one cache line */
+#endif
 
-    /* ===== COLD FIELDS - Second cache line (bytes 64+) ===== */
+    /* ===== COLD FIELDS ===== */
     /* These fields are only accessed during route registration or validation */
 
     zend_string *segment;           /* Path segment - only used during insertion (8 bytes) */
-    zend_ulong segment_hash;        /* Pre-computed hash of segment for fast lookup (8 bytes) */
     sf_param_constraint *constraint;/* Parameter constraint - post-match validation (8 bytes) */
-    sf_trie_node *parent;           /* Parent node - tree manipulation only (8 bytes) */
     uint32_t depth;                 /* Depth in tree - insertion/debug only (4 bytes) */
-    uint8_t _cold_padding[4];       /* Padding for alignment (4 bytes) */
-    /* Total cold: 40 bytes */
 } SF_CACHE_ALIGNED;
 
 /* Match result structure */

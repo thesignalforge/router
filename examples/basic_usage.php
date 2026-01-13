@@ -36,7 +36,7 @@ Router::get('/users/{userId}/posts/{postId}', function (int $userId, int $postId
 })->whereNumber(['userId', 'postId']);
 
 // Named route for URL generation
-Router::get('/articles/{slug}', 'ArticleController@show')
+Router::get('/articles/{slug}', [ArticleController::class, 'show'])
     ->name('articles.show')
     ->whereAlpha('slug');
 
@@ -44,58 +44,58 @@ Router::get('/articles/{slug}', 'ArticleController@show')
 // 2. HTTP Methods
 // ============================================================================
 
-Router::post('/users', 'UserController@store');
-Router::put('/users/{id}', 'UserController@update');
-Router::patch('/users/{id}', 'UserController@patch');
-Router::delete('/users/{id}', 'UserController@destroy');
+Router::post('/users', [UserController::class, 'store']);
+Router::put('/users/{id}', [UserController::class, 'update']);
+Router::patch('/users/{id}', [UserController::class, 'patch']);
+Router::delete('/users/{id}', [UserController::class, 'destroy']);
 Router::options('/api/resource', fn() => ['GET', 'POST', 'PUT', 'DELETE']);
 
 // Match any HTTP method
-Router::any('/webhook', 'WebhookController@handle');
+Router::any('/webhook', [WebhookController::class, 'handle']);
 
 // ============================================================================
 // 3. Parameter Constraints
 // ============================================================================
 
 // Custom regex constraint
-Router::get('/products/{sku}', 'ProductController@show')
+Router::get('/products/{sku}', [ProductController::class, 'show'])
     ->where('sku', '[A-Z]{2}-[0-9]{4}');
 
 // Multiple constraints
-Router::get('/catalog/{category}/{item}', 'CatalogController@show')
+Router::get('/catalog/{category}/{item}', [CatalogController::class, 'show'])
     ->where([
         'category' => '[a-z-]+',
         'item' => '[a-z0-9-]+'
     ]);
 
 // Predefined constraint helpers
-Router::get('/orders/{id}', 'OrderController@show')
+Router::get('/orders/{id}', [OrderController::class, 'show'])
     ->whereNumber('id');
 
-Router::get('/tags/{tag}', 'TagController@show')
+Router::get('/tags/{tag}', [TagController::class, 'show'])
     ->whereAlpha('tag');
 
-Router::get('/search/{query}', 'SearchController@search')
+Router::get('/search/{query}', [SearchController::class, 'search'])
     ->whereAlphaNumeric('query');
 
-Router::get('/resources/{uuid}', 'ResourceController@show')
+Router::get('/resources/{uuid}', [ResourceController::class, 'show'])
     ->whereUuid('uuid');
 
-Router::get('/events/{ulid}', 'EventController@show')
+Router::get('/events/{ulid}', [EventController::class, 'show'])
     ->whereUlid('ulid');
 
 // Constrain to specific values
-Router::get('/status/{status}', 'StatusController@show')
+Router::get('/status/{status}', [StatusController::class, 'show'])
     ->whereIn('status', ['pending', 'active', 'completed', 'cancelled']);
 
 // ============================================================================
 // 4. Default Parameter Values
 // ============================================================================
 
-Router::get('/search/{query?}', 'SearchController@index')
+Router::get('/search/{query?}', [SearchController::class, 'index'])
     ->defaults('query', 'all');
 
-Router::get('/pagination/{page?}/{perPage?}', 'PaginationController@index')
+Router::get('/pagination/{page?}/{perPage?}', [PaginationController::class, 'index'])
     ->defaults('page', 1)
     ->defaults('perPage', 25);
 
@@ -104,19 +104,19 @@ Router::get('/pagination/{page?}/{perPage?}', 'PaginationController@index')
 // ============================================================================
 
 // Single middleware
-Router::get('/dashboard', 'DashboardController@index')
+Router::get('/dashboard', [DashboardController::class, 'index'])
     ->middleware('auth');
 
 // Multiple middleware
-Router::get('/admin', 'AdminController@index')
+Router::get('/admin', [AdminController::class, 'index'])
     ->middleware(['auth', 'admin', 'log']);
 
 // Middleware with parameters (when supported by your middleware resolver)
-Router::get('/api/users', 'Api\UserController@index')
+Router::get('/api/users', [Api\UserController::class, 'index'])
     ->middleware('throttle:60,1');
 
 // Remove middleware
-Router::get('/public-stats', 'StatsController@public')
+Router::get('/public-stats', [StatsController::class, 'public'])
     ->middleware(['auth', 'log'])
     ->withoutMiddleware('auth');
 
@@ -126,9 +126,9 @@ Router::get('/public-stats', 'StatsController@public')
 
 // Basic group with prefix
 Router::group(['prefix' => '/api/v1'], function () {
-    Router::get('/users', 'Api\V1\UserController@index');
-    Router::get('/posts', 'Api\V1\PostController@index');
-    Router::get('/comments', 'Api\V1\CommentController@index');
+    Router::get('/users', [Api\V1\UserController::class, 'index']);
+    Router::get('/posts', [Api\V1\PostController::class, 'index']);
+    Router::get('/comments', [Api\V1\CommentController::class, 'index']);
 });
 
 // Group with middleware
@@ -136,18 +136,9 @@ Router::group([
     'prefix' => '/admin',
     'middleware' => ['auth', 'admin']
 ], function () {
-    Router::get('/dashboard', 'Admin\DashboardController@index');
-    Router::get('/users', 'Admin\UserController@index');
-    Router::post('/users', 'Admin\UserController@store');
-});
-
-// Group with namespace
-Router::group([
-    'prefix' => '/api/v2',
-    'namespace' => 'App\Http\Controllers\Api\V2'
-], function () {
-    Router::get('/users', 'UserController@index');
-    Router::get('/products', 'ProductController@index');
+    Router::get('/dashboard', [Admin\DashboardController::class, 'index']);
+    Router::get('/users', [Admin\UserController::class, 'index']);
+    Router::post('/users', [Admin\UserController::class, 'store']);
 });
 
 // Group with name prefix
@@ -155,19 +146,19 @@ Router::group([
     'prefix' => '/blog',
     'as' => 'blog.'
 ], function () {
-    Router::get('/', 'BlogController@index')->name('index');
-    Router::get('/{slug}', 'BlogController@show')->name('show');
-    Router::get('/{slug}/comments', 'BlogController@comments')->name('comments');
+    Router::get('/', [BlogController::class, 'index'])->name('index');
+    Router::get('/{slug}', [BlogController::class, 'show'])->name('show');
+    Router::get('/{slug}/comments', [BlogController::class, 'comments'])->name('comments');
 });
 
 // Nested groups
 Router::group(['prefix' => '/api'], function () {
     Router::group(['prefix' => '/v1', 'middleware' => ['api.v1']], function () {
-        Router::get('/users', 'Api\V1\UserController@index');
+        Router::get('/users', [Api\V1\UserController::class, 'index']);
     });
 
     Router::group(['prefix' => '/v2', 'middleware' => ['api.v2']], function () {
-        Router::get('/users', 'Api\V2\UserController@index');
+        Router::get('/users', [Api\V2\UserController::class, 'index']);
     });
 });
 
@@ -176,11 +167,11 @@ Router::group(['prefix' => '/api'], function () {
 // ============================================================================
 
 // Static domain constraint
-Router::get('/dashboard', 'DashboardController@index')
+Router::get('/dashboard', [DashboardController::class, 'index'])
     ->domain('admin.example.com');
 
 // Dynamic subdomain
-Router::get('/profile', 'TenantController@profile')
+Router::get('/profile', [TenantController::class, 'profile'])
     ->domain('{tenant}.example.com');
 
 // Domain in group
@@ -188,8 +179,8 @@ Router::group([
     'domain' => '{account}.myapp.com',
     'prefix' => '/api'
 ], function () {
-    Router::get('/settings', 'Account\SettingsController@index');
-    Router::get('/users', 'Account\UserController@index');
+    Router::get('/settings', [Account\SettingsController::class, 'index']);
+    Router::get('/users', [Account\UserController::class, 'index']);
 });
 
 // ============================================================================
@@ -197,10 +188,10 @@ Router::group([
 // ============================================================================
 
 // Catch-all wildcard (captures remaining path)
-Router::get('/docs/{path*}', 'DocsController@show');
+Router::get('/docs/{path*}', [DocsController::class, 'show']);
 
 // Alternative syntax
-Router::get('/files/{filepath...}', 'FileController@serve');
+Router::get('/files/{filepath...}', [FileController::class, 'serve']);
 
 // ============================================================================
 // 9. Fallback Route
@@ -322,46 +313,46 @@ function bootstrapRouter(): void
         'middleware' => ['api', 'throttle:60,1']
     ], function () {
         // Public API
-        Router::get('/status', 'Api\StatusController@index');
+        Router::get('/status', [Api\StatusController::class, 'index']);
 
         // Authenticated API
         Router::group(['middleware' => ['auth:sanctum']], function () {
-            Router::get('/user', 'Api\UserController@current');
-            Router::get('/users', 'Api\UserController@index');
-            Router::post('/users', 'Api\UserController@store');
-            Router::get('/users/{id}', 'Api\UserController@show')
+            Router::get('/user', [Api\UserController::class, 'current']);
+            Router::get('/users', [Api\UserController::class, 'index']);
+            Router::post('/users', [Api\UserController::class, 'store']);
+            Router::get('/users/{id}', [Api\UserController::class, 'show'])
                 ->whereNumber('id')
                 ->name('api.users.show');
-            Router::put('/users/{id}', 'Api\UserController@update')
+            Router::put('/users/{id}', [Api\UserController::class, 'update'])
                 ->whereNumber('id');
-            Router::delete('/users/{id}', 'Api\UserController@destroy')
+            Router::delete('/users/{id}', [Api\UserController::class, 'destroy'])
                 ->whereNumber('id');
         });
     });
 
     // Web routes
     Router::group(['middleware' => ['web']], function () {
-        Router::get('/', 'HomeController@index')->name('home');
-        Router::get('/about', 'PageController@about')->name('about');
-        Router::get('/contact', 'PageController@contact')->name('contact');
-        Router::post('/contact', 'PageController@submitContact');
+        Router::get('/', [HomeController::class, 'index'])->name('home');
+        Router::get('/about', [PageController::class, 'about'])->name('about');
+        Router::get('/contact', [PageController::class, 'contact'])->name('contact');
+        Router::post('/contact', [PageController::class, 'submitContact']);
 
         // Auth routes
         Router::group(['middleware' => ['guest']], function () {
-            Router::get('/login', 'Auth\LoginController@showForm')->name('login');
-            Router::post('/login', 'Auth\LoginController@login');
-            Router::get('/register', 'Auth\RegisterController@showForm')->name('register');
-            Router::post('/register', 'Auth\RegisterController@register');
+            Router::get('/login', [Auth\LoginController::class, 'showForm'])->name('login');
+            Router::post('/login', [Auth\LoginController::class, 'login']);
+            Router::get('/register', [Auth\RegisterController::class, 'showForm'])->name('register');
+            Router::post('/register', [Auth\RegisterController::class, 'register']);
         });
 
         // Authenticated routes
         Router::group(['middleware' => ['auth']], function () {
-            Router::get('/dashboard', 'DashboardController@index')->name('dashboard');
-            Router::post('/logout', 'Auth\LoginController@logout')->name('logout');
+            Router::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+            Router::post('/logout', [Auth\LoginController::class, 'logout'])->name('logout');
 
             // User settings
-            Router::get('/settings', 'SettingsController@index')->name('settings');
-            Router::put('/settings', 'SettingsController@update');
+            Router::get('/settings', [SettingsController::class, 'index'])->name('settings');
+            Router::put('/settings', [SettingsController::class, 'update']);
         });
     });
 
