@@ -153,11 +153,12 @@ struct _sf_trie_node {
     /* These fields are only accessed during route registration or validation */
 
     zend_string *segment;           /* Path segment - only used during insertion (8 bytes) */
+    zend_ulong segment_hash;        /* Pre-computed hash of segment for fast lookup (8 bytes) */
     sf_param_constraint *constraint;/* Parameter constraint - post-match validation (8 bytes) */
     sf_trie_node *parent;           /* Parent node - tree manipulation only (8 bytes) */
     uint32_t depth;                 /* Depth in tree - insertion/debug only (4 bytes) */
     uint8_t _cold_padding[4];       /* Padding for alignment (4 bytes) */
-    /* Total cold: 32 bytes */
+    /* Total cold: 40 bytes */
 } SF_CACHE_ALIGNED;
 
 /* Match result structure */
