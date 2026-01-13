@@ -357,12 +357,13 @@ zend_bool sf_constraint_validate(sf_param_constraint *constraint, zend_string *v
 {
     int rc;
 
-    if (!constraint || !value) {
+    /* Null checks - defensive, should rarely fail */
+    if (UNEXPECTED(!constraint || !value)) {
         return 0;
     }
 
-    /* No pattern means always valid */
-    if (!constraint->compiled_regex) {
+    /* No pattern means always valid - early exit */
+    if (UNEXPECTED(!constraint->compiled_regex)) {
         return 1;
     }
 
@@ -376,7 +377,8 @@ zend_bool sf_constraint_validate(sf_param_constraint *constraint, zend_string *v
         NULL
     );
 
-    return rc >= 0;
+    /* Most validation should succeed */
+    return EXPECTED(rc >= 0);
 }
 
 /* ============================================================================
@@ -1450,13 +1452,13 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
     const char *ptr = path;
     const char *end = path + path_len;
 
-    /* Skip leading slash */
-    if (ptr < end && *ptr == '/') {
+    /* Skip leading slash - virtually all URIs have a leading slash */
+    if (EXPECTED(ptr < end && *ptr == '/')) {
         ptr++;
     }
 
     /* Empty path (root) - check if current node is terminal */
-    if (ptr >= end || (ptr + 1 == end && *ptr == '/')) {
+    if (UNEXPECTED(ptr >= end || (ptr + 1 == end && *ptr == '/'))) {
         if (node->is_terminal) {
             return node;
         }
@@ -1483,8 +1485,8 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
 
     /* Priority order: Static > Param > Optional > Wildcard */
 
-    /* 1. Try static children first */
-    if (node->static_children) {
+    /* 1. Try static children first (most common case - routes like /api/users/list) */
+    if (EXPECTED(node->static_children != NULL)) {
         /*
          * Use zend_hash_str_find() to avoid allocating a temporary zend_string
          * on every segment lookup. This is a hot path called for every segment
@@ -1493,16 +1495,16 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
          */
         zval *child_zv = zend_hash_str_find(node->static_children, seg_start, seg_len);
 
-        if (child_zv) {
+        if (EXPECTED(child_zv != NULL)) {
             sf_trie_node *child = (sf_trie_node *)Z_PTR_P(child_zv);
             result = sf_trie_match_internal(child, remaining, remaining_len, params, depth + 1);
-            if (result) {
+            if (EXPECTED(result != NULL)) {
                 return result;
             }
         }
     }
 
-    /* 2. Try required parameter child */
+    /* 2. Try required parameter child (common in REST APIs: /users/{id}) */
     if (node->param_child) {
         /* Store parameter value */
         zval param_val;
@@ -1510,7 +1512,7 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
         zend_hash_update(params, node->param_child->param_name, &param_val);
 
         result = sf_trie_match_internal(node->param_child, remaining, remaining_len, params, depth + 1);
-        if (result) {
+        if (EXPECTED(result != NULL)) {
             return result;
         }
 
@@ -1518,8 +1520,8 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
         zend_hash_del(params, node->param_child->param_name);
     }
 
-    /* 3. Try optional parameter child (also try skipping it) */
-    if (node->optional_child) {
+    /* 3. Try optional parameter child - less common than required params */
+    if (UNEXPECTED(node->optional_child != NULL)) {
         /* First try with parameter value */
         zval param_val;
         ZVAL_STRINGL(&param_val, seg_start, seg_len);
@@ -1541,8 +1543,8 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
         }
     }
 
-    /* 4. Try wildcard (consumes all remaining path) */
-    if (node->wildcard_child) {
+    /* 4. Try wildcard (consumes all remaining path) - rare, used for catch-all routes */
+    if (UNEXPECTED(node->wildcard_child != NULL)) {
         /* Wildcard captures everything remaining including this segment */
         zval param_val;
         ZVAL_STRINGL(&param_val, seg_start, end - seg_start);
@@ -1563,17 +1565,18 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
     sf_trie_node *root;
     sf_trie_node *matched_node;
 
-    if (!router || !uri) {
+    /* Null checks - should virtually never fail in production */
+    if (UNEXPECTED(!router || !uri)) {
         return NULL;
     }
 
     result = sf_match_result_create();
-    if (!result) {
+    if (UNEXPECTED(!result)) {
         return NULL;
     }
 
-    /* Get method-specific trie */
-    if (method >= SF_METHOD_COUNT) {
+    /* Get method-specific trie - invalid method is extremely rare */
+    if (UNEXPECTED(method >= SF_METHOD_COUNT)) {
         result->matched = 0;
         result->error = zend_string_init("Invalid HTTP method", sizeof("Invalid HTTP method") - 1, 0);
         return result;
@@ -1585,14 +1588,15 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
     root = router->method_tries[method];
     matched_node = sf_trie_match_internal(root, uri, uri_len, result->params, 0);
 
-    if (matched_node && matched_node->is_terminal) {
-        /* Validate parameters against constraints */
-        if (sf_validate_params(matched_node->route, result->params)) {
+    /* Most requests should match a defined route */
+    if (EXPECTED(matched_node != NULL && matched_node->is_terminal)) {
+        /* Validate parameters against constraints - usually passes */
+        if (EXPECTED(sf_validate_params(matched_node->route, result->params))) {
             result->matched = 1;
             result->route = matched_node->route;
 
             /* Apply default values for missing optional parameters */
-            if (matched_node->route->defaults) {
+            if (UNEXPECTED(matched_node->route->defaults != NULL)) {
                 zend_string *key;
                 zval *val;
                 ZEND_HASH_FOREACH_STR_KEY_VAL(matched_node->route->defaults, key, val) {
@@ -1716,11 +1720,13 @@ sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method met
 
 zend_bool sf_validate_params(sf_route *route, HashTable *params)
 {
-    if (!route || !params) {
+    /* Null checks - defensive, should rarely fail */
+    if (UNEXPECTED(!route || !params)) {
         return 1; /* No constraints = always valid */
     }
 
-    if (!route->wheres) {
+    /* Most routes don't have constraints, so this is the fast path */
+    if (EXPECTED(route->wheres == NULL)) {
         return 1;
     }
 
@@ -1728,13 +1734,14 @@ zend_bool sf_validate_params(sf_route *route, HashTable *params)
     zval *constraint_zv;
 
     ZEND_HASH_FOREACH_STR_KEY_VAL(route->wheres, key, constraint_zv) {
-        if (!key) continue;
+        if (UNEXPECTED(!key)) continue;
 
         sf_param_constraint *constraint = (sf_param_constraint *)Z_PTR_P(constraint_zv);
         zval *param_val = zend_hash_find(params, key);
 
-        if (param_val && Z_TYPE_P(param_val) == IS_STRING) {
-            if (!sf_constraint_validate(constraint, Z_STR_P(param_val))) {
+        if (EXPECTED(param_val != NULL && Z_TYPE_P(param_val) == IS_STRING)) {
+            /* Constraints usually validate - rejection is the error case */
+            if (UNEXPECTED(!sf_constraint_validate(constraint, Z_STR_P(param_val)))) {
                 return 0;
             }
         }
