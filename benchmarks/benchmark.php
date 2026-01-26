@@ -1,12 +1,26 @@
 <?php
 /**
- * Router Benchmark Script
+ * Router Benchmark Script - Complex Multi-Parameter Routes
  *
- * Compares performance of:
+ * Compares performance of routes with 1-10 path parameters (some optional):
  * - Signalforge Router (C extension)
- * - Laravel Router
- * - Symfony Router
  * - FastRoute (nikic/fast-route)
+ * - Symfony Router
+ * - Laravel Router
+ *
+ * Routes are distributed across 10 complexity tiers:
+ *   Tier  1:  1 param   /t1rN/items/{id}
+ *   Tier  2:  2 params  /t2rN/users/{userId}/posts/{postId}
+ *   Tier  3:  3 params  /t3rN/users/{userId}/posts/{postId}/comments/{commentId?}        (optional)
+ *   Tier  4:  4 params  /t4rN/orgs/{orgId}/teams/{teamId}/projects/{projectId}/tasks/{taskId}
+ *   Tier  5:  5 params  /t5rN/orgs/{orgId}/teams/{teamId}/.../sub/{subtaskId?}            (optional)
+ *   Tier  6:  6 params  /t6rN/r/{regionId}/z/{zoneId}/c/{clusterId}/.../v/{versionId}
+ *   Tier  7:  7 params  /t7rN/a/{p1}/b/{p2}/.../g/{p7?}                                  (optional)
+ *   Tier  8:  8 params  /t8rN/a/{p1}/b/{p2}/.../h/{p8}
+ *   Tier  9:  9 params  /t9rN/a/{p1}/b/{p2}/.../i/{p9?}                                  (optional)
+ *   Tier 10: 10 params  /t10rN/a/{p1}/b/{p2}/.../j/{p10}
+ *
+ * All parameters have numeric (\d+) constraints for fair comparison.
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
@@ -30,16 +44,84 @@ if (!extension_loaded('signalforge_routing')) {
 }
 
 // Configuration
-$routeCounts = [1, 10, 100, 1000, 10000, 20000];
-$signalforgeOnlyRoutes = [100000]; // Only Signalforge tested for these counts
-$iterations = 1000; // Number of match operations per test
-$memoryLimit = 1024 * 1024 * 1024; // 1 GB memory limit per router
+$routeCounts = [10, 50, 100, 500, 1000];
+$iterations = 1000;
 
 // Results storage
 $results = [];
 
+// ============================================================================
+// Route Generation
+// ============================================================================
+
 /**
- * Generate test routes
+ * Build a route specification for a given complexity tier and index.
+ *
+ * @param int $tier  0-9 (maps to 1-10 parameters)
+ * @param int $idx   Unique index within this tier
+ * @return array     ['uri' => base URI, 'params' => [[name, optional], ...]]
+ */
+function buildTierRoute(int $tier, int $idx): array
+{
+    $prefix = "/t" . ($tier + 1) . "r{$idx}";
+
+    switch ($tier) {
+        case 0: // 1 param
+            return [
+                'uri' => "{$prefix}/items/{id}",
+                'params' => [['id', false]],
+            ];
+        case 1: // 2 params
+            return [
+                'uri' => "{$prefix}/users/{userId}/posts/{postId}",
+                'params' => [['userId', false], ['postId', false]],
+            ];
+        case 2: // 3 params, last optional
+            return [
+                'uri' => "{$prefix}/users/{userId}/posts/{postId}/comments/{commentId}",
+                'params' => [['userId', false], ['postId', false], ['commentId', true]],
+            ];
+        case 3: // 4 params
+            return [
+                'uri' => "{$prefix}/orgs/{orgId}/teams/{teamId}/projects/{projectId}/tasks/{taskId}",
+                'params' => [['orgId', false], ['teamId', false], ['projectId', false], ['taskId', false]],
+            ];
+        case 4: // 5 params, last optional
+            return [
+                'uri' => "{$prefix}/orgs/{orgId}/teams/{teamId}/projects/{projectId}/tasks/{taskId}/sub/{subtaskId}",
+                'params' => [['orgId', false], ['teamId', false], ['projectId', false], ['taskId', false], ['subtaskId', true]],
+            ];
+        case 5: // 6 params
+            return [
+                'uri' => "{$prefix}/r/{regionId}/z/{zoneId}/c/{clusterId}/s/{serviceId}/e/{endpointId}/v/{versionId}",
+                'params' => [['regionId', false], ['zoneId', false], ['clusterId', false], ['serviceId', false], ['endpointId', false], ['versionId', false]],
+            ];
+        case 6: // 7 params, last optional
+            return [
+                'uri' => "{$prefix}/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}",
+                'params' => [['p1', false], ['p2', false], ['p3', false], ['p4', false], ['p5', false], ['p6', false], ['p7', true]],
+            ];
+        case 7: // 8 params
+            return [
+                'uri' => "{$prefix}/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}/h/{p8}",
+                'params' => [['p1', false], ['p2', false], ['p3', false], ['p4', false], ['p5', false], ['p6', false], ['p7', false], ['p8', false]],
+            ];
+        case 8: // 9 params, last optional
+            return [
+                'uri' => "{$prefix}/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}/h/{p8}/i/{p9}",
+                'params' => [['p1', false], ['p2', false], ['p3', false], ['p4', false], ['p5', false], ['p6', false], ['p7', false], ['p8', false], ['p9', true]],
+            ];
+        case 9: // 10 params
+            return [
+                'uri' => "{$prefix}/a/{p1}/b/{p2}/c/{p3}/d/{p4}/e/{p5}/f/{p6}/g/{p7}/h/{p8}/i/{p9}/j/{p10}",
+                'params' => [['p1', false], ['p2', false], ['p3', false], ['p4', false], ['p5', false], ['p6', false], ['p7', false], ['p8', false], ['p9', false], ['p10', false]],
+            ];
+    }
+    return [];
+}
+
+/**
+ * Generate route specifications distributed across 10 complexity tiers.
  */
 function generateRoutes(int $count): array
 {
@@ -47,51 +129,132 @@ function generateRoutes(int $count): array
     $methods = ['GET', 'POST', 'PUT', 'DELETE'];
 
     for ($i = 0; $i < $count; $i++) {
+        $tier = $i % 10;
+        $tierIndex = intdiv($i, 10);
         $method = $methods[$i % 4];
+
+        $spec = buildTierRoute($tier, $tierIndex);
         $routes[] = [
+            'uri'    => $spec['uri'],
+            'params' => $spec['params'],
             'method' => $method,
-            'uri' => "/api/v1/resource{$i}/{id}",
-            'handler' => "Controller{$i}@action",
-            'name' => "route_{$i}"
+            'name'   => "route_{$i}",
+            'tier'   => $tier + 1,
         ];
     }
-
-    // Add some static routes for variety
-    $routes[] = ['method' => 'GET', 'uri' => '/api/v1/users', 'handler' => 'UserController@index', 'name' => 'users.index'];
-    $routes[] = ['method' => 'GET', 'uri' => '/api/v1/posts', 'handler' => 'PostController@index', 'name' => 'posts.index'];
-    $routes[] = ['method' => 'GET', 'uri' => '/health', 'handler' => 'HealthController@check', 'name' => 'health'];
 
     return $routes;
 }
 
+// ============================================================================
+// URI Conversion Helpers
+// ============================================================================
+
 /**
- * Generate test URIs to match against
+ * Convert base URI to Signalforge/Laravel format (mark optional params with ?).
+ */
+function toOptionalUri(string $uri, array $params): string
+{
+    foreach ($params as [$name, $optional]) {
+        if ($optional) {
+            $uri = str_replace("{{$name}}", "{{$name}?}", $uri);
+        }
+    }
+    return $uri;
+}
+
+/**
+ * Convert base URI to FastRoute format ({param:\d+} constraints, [...] optional).
+ */
+function toFastRouteUri(string $uri, array $params): string
+{
+    $optionalName = null;
+
+    foreach ($params as [$name, $optional]) {
+        if ($optional) {
+            $optionalName = $name;
+            continue;
+        }
+        $uri = str_replace("{{$name}}", "{{$name}:\\d+}", $uri);
+    }
+
+    if ($optionalName === null) {
+        return $uri;
+    }
+
+    // Split off the trailing optional segment (preceding static + param)
+    $placeholder = "{{$optionalName}}";
+    $paramPos = strpos($uri, $placeholder);
+    $beforeParam = rtrim(substr($uri, 0, $paramPos), '/');
+    $lastSlash = strrpos($beforeParam, '/');
+
+    $required = substr($uri, 0, $lastSlash);
+    $optionalPart = substr($uri, $lastSlash);
+    $optionalPart = str_replace("{{$optionalName}}", "{{$optionalName}:\\d+}", $optionalPart);
+
+    return $required . '[' . $optionalPart . ']';
+}
+
+/**
+ * Build a concrete test URI by replacing all params with numeric values.
+ */
+function buildTestUri(string $uri, array $params): string
+{
+    foreach ($params as $i => [$name, $optional]) {
+        $uri = str_replace("{{$name}}", (string)(100 + $i), $uri);
+    }
+    return $uri;
+}
+
+/**
+ * Get Symfony requirements array (all params → \d+).
+ */
+function getSymfonyRequirements(array $params): array
+{
+    $reqs = [];
+    foreach ($params as [$name, $optional]) {
+        $reqs[$name] = '\\d+';
+    }
+    return $reqs;
+}
+
+/**
+ * Get Symfony defaults array (optional params get empty-string default).
+ */
+function getSymfonyDefaults(array $params, string $handler): array
+{
+    $defaults = ['_controller' => $handler];
+    foreach ($params as [$name, $optional]) {
+        if ($optional) {
+            $defaults[$name] = '';
+        }
+    }
+    return $defaults;
+}
+
+/**
+ * Generate deterministic test URIs from route specs (evenly sampled, up to 50).
  */
 function generateTestUris(array $routes): array
 {
     $uris = [];
-
-    // Pick some routes to match
     $sampleSize = min(count($routes), 50);
-    $indices = array_rand(array_flip(range(0, count($routes) - 1)), $sampleSize);
-    if (!is_array($indices)) $indices = [$indices];
+    $step = max(1, intdiv(count($routes), $sampleSize));
 
-    foreach ($indices as $i) {
-        if (isset($routes[$i])) {
-            $route = $routes[$i];
-            // Replace {id} with actual value
-            $uri = str_replace('{id}', '123', $route['uri']);
-            $uris[] = ['method' => $route['method'], 'uri' => $uri];
-        }
+    for ($i = 0; $i < count($routes) && count($uris) < $sampleSize; $i += $step) {
+        $route = $routes[$i];
+        $uris[] = [
+            'method' => $route['method'],
+            'uri'    => buildTestUri($route['uri'], $route['params']),
+        ];
     }
-
-    // Add known static routes
-    $uris[] = ['method' => 'GET', 'uri' => '/api/v1/users'];
-    $uris[] = ['method' => 'GET', 'uri' => '/api/v1/posts'];
-    $uris[] = ['method' => 'GET', 'uri' => '/health'];
 
     return $uris;
 }
+
+// ============================================================================
+// Benchmark Functions
+// ============================================================================
 
 /**
  * Benchmark Signalforge Router
@@ -101,14 +264,16 @@ function benchmarkSignalforge(array $routes, array $testUris, int $iterations): 
     gc_collect_cycles();
     $memBefore = memory_get_usage(true);
 
-    // Register routes
     Router::flush();
     $regStart = microtime(true);
 
     foreach ($routes as $route) {
         $method = strtolower($route['method']);
-        Router::$method($route['uri'], fn() => 'ok')
-            ->whereNumber('id')
+        $sfUri = toOptionalUri($route['uri'], $route['params']);
+        $paramNames = array_map(fn($p) => $p[0], $route['params']);
+
+        Router::$method($sfUri, fn() => 'ok')
+            ->whereNumber($paramNames)
             ->name($route['name']);
     }
 
@@ -130,44 +295,35 @@ function benchmarkSignalforge(array $routes, array $testUris, int $iterations): 
 
     $matchTime = (microtime(true) - $matchStart) * 1000;
     $totalMatches = $iterations * count($testUris);
-    $memUsed = $memAfterReg - $memBefore;
 
     return [
-        'registration_ms' => $regTime,
-        'matching_ms' => $matchTime,
-        'matches_per_sec' => $totalMatches / ($matchTime / 1000),
-        'total_matches' => $totalMatches,
+        'registration_ms'    => $regTime,
+        'matching_ms'        => $matchTime,
+        'matches_per_sec'    => $totalMatches / ($matchTime / 1000),
+        'total_matches'      => $totalMatches,
         'successful_matches' => $matched,
-        'memory_used' => $memUsed
+        'memory_used'        => $memAfterReg - $memBefore,
     ];
 }
 
 /**
- * Benchmark Laravel Router
+ * Benchmark FastRoute
  */
-function benchmarkLaravel(array $routes, array $testUris, int $iterations): array
+function benchmarkFastRoute(array $routes, array $testUris, int $iterations): array
 {
     gc_collect_cycles();
     $memBefore = memory_get_usage(true);
 
-    $container = new Container();
-    $events = new Dispatcher($container);
-    $router = new LaravelRouter($events, $container);
-
-    // Register routes
     $regStart = microtime(true);
 
-    foreach ($routes as $route) {
-        $method = strtolower($route['method']);
-        $router->$method($route['uri'], ['uses' => $route['handler']])
-            ->where('id', '[0-9]+')
-            ->name($route['name']);
-    }
+    $dispatcher = FastRoute\simpleDispatcher(function (RouteCollector $r) use ($routes) {
+        foreach ($routes as $route) {
+            $frUri = toFastRouteUri($route['uri'], $route['params']);
+            $r->addRoute($route['method'], $frUri, $route['name']);
+        }
+    });
 
     $regTime = (microtime(true) - $regStart) * 1000;
-
-    // Compile routes
-    $router->getRoutes()->refreshNameLookups();
     $memAfterReg = memory_get_usage(true);
 
     // Match routes
@@ -176,32 +332,25 @@ function benchmarkLaravel(array $routes, array $testUris, int $iterations): arra
 
     for ($i = 0; $i < $iterations; $i++) {
         foreach ($testUris as $test) {
-            try {
-                $request = Request::create($test['uri'], $test['method']);
-                $route = $router->getRoutes()->match($request);
-                if ($route) {
-                    $matched++;
-                }
-            } catch (\Exception $e) {
-                // Route not found
+            $result = $dispatcher->dispatch($test['method'], $test['uri']);
+            if ($result[0] === FastRouteDispatcher::FOUND) {
+                $matched++;
             }
         }
     }
 
     $matchTime = (microtime(true) - $matchStart) * 1000;
     $totalMatches = $iterations * count($testUris);
-    $memUsed = $memAfterReg - $memBefore;
 
-    // Cleanup
-    unset($router, $container, $events);
+    unset($dispatcher);
 
     return [
-        'registration_ms' => $regTime,
-        'matching_ms' => $matchTime,
-        'matches_per_sec' => $totalMatches / ($matchTime / 1000),
-        'total_matches' => $totalMatches,
+        'registration_ms'    => $regTime,
+        'matching_ms'        => $matchTime,
+        'matches_per_sec'    => $totalMatches / ($matchTime / 1000),
+        'total_matches'      => $totalMatches,
         'successful_matches' => $matched,
-        'memory_used' => $memUsed
+        'memory_used'        => $memAfterReg - $memBefore,
     ];
 }
 
@@ -214,15 +363,13 @@ function benchmarkSymfony(array $routes, array $testUris, int $iterations): arra
     $memBefore = memory_get_usage(true);
 
     $collection = new RouteCollection();
-
-    // Register routes
     $regStart = microtime(true);
 
     foreach ($routes as $route) {
         $sfRoute = new SymfonyRoute(
             $route['uri'],
-            ['_controller' => $route['handler']],
-            ['id' => '\d+'],
+            getSymfonyDefaults($route['params'], $route['name']),
+            getSymfonyRequirements($route['params']),
             [],
             '',
             [],
@@ -233,7 +380,6 @@ function benchmarkSymfony(array $routes, array $testUris, int $iterations): arra
 
     $regTime = (microtime(true) - $regStart) * 1000;
 
-    // Create matcher
     $context = new RequestContext();
     $matcher = new UrlMatcher($collection, $context);
     $memAfterReg = memory_get_usage(true);
@@ -258,39 +404,49 @@ function benchmarkSymfony(array $routes, array $testUris, int $iterations): arra
 
     $matchTime = (microtime(true) - $matchStart) * 1000;
     $totalMatches = $iterations * count($testUris);
-    $memUsed = $memAfterReg - $memBefore;
 
-    // Cleanup
     unset($matcher, $collection, $context);
 
     return [
-        'registration_ms' => $regTime,
-        'matching_ms' => $matchTime,
-        'matches_per_sec' => $totalMatches / ($matchTime / 1000),
-        'total_matches' => $totalMatches,
+        'registration_ms'    => $regTime,
+        'matching_ms'        => $matchTime,
+        'matches_per_sec'    => $totalMatches / ($matchTime / 1000),
+        'total_matches'      => $totalMatches,
         'successful_matches' => $matched,
-        'memory_used' => $memUsed
+        'memory_used'        => $memAfterReg - $memBefore,
     ];
 }
 
 /**
- * Benchmark FastRoute
+ * Benchmark Laravel Router
  */
-function benchmarkFastRoute(array $routes, array $testUris, int $iterations): array
+function benchmarkLaravel(array $routes, array $testUris, int $iterations): array
 {
     gc_collect_cycles();
     $memBefore = memory_get_usage(true);
 
-    // Register routes
+    $container = new Container();
+    $events = new Dispatcher($container);
+    $router = new LaravelRouter($events, $container);
+
     $regStart = microtime(true);
 
-    $dispatcher = FastRoute\simpleDispatcher(function(RouteCollector $r) use ($routes) {
-        foreach ($routes as $route) {
-            $r->addRoute($route['method'], $route['uri'], $route['handler']);
+    foreach ($routes as $route) {
+        $method = strtolower($route['method']);
+        $laUri = toOptionalUri($route['uri'], $route['params']);
+
+        $constraints = [];
+        foreach ($route['params'] as [$name, $optional]) {
+            $constraints[$name] = '[0-9]+';
         }
-    });
+
+        $router->$method($laUri, ['uses' => 'Controller@action'])
+            ->where($constraints)
+            ->name($route['name']);
+    }
 
     $regTime = (microtime(true) - $regStart) * 1000;
+    $router->getRoutes()->refreshNameLookups();
     $memAfterReg = memory_get_usage(true);
 
     // Match routes
@@ -299,41 +455,42 @@ function benchmarkFastRoute(array $routes, array $testUris, int $iterations): ar
 
     for ($i = 0; $i < $iterations; $i++) {
         foreach ($testUris as $test) {
-            $result = $dispatcher->dispatch($test['method'], $test['uri']);
-            if ($result[0] === FastRouteDispatcher::FOUND) {
-                $matched++;
+            try {
+                $request = Request::create($test['uri'], $test['method']);
+                $matchedRoute = $router->getRoutes()->match($request);
+                if ($matchedRoute) {
+                    $matched++;
+                }
+            } catch (\Exception $e) {
+                // Route not found
             }
         }
     }
 
     $matchTime = (microtime(true) - $matchStart) * 1000;
     $totalMatches = $iterations * count($testUris);
-    $memUsed = $memAfterReg - $memBefore;
 
-    // Cleanup
-    unset($dispatcher);
+    unset($router, $container, $events);
 
     return [
-        'registration_ms' => $regTime,
-        'matching_ms' => $matchTime,
-        'matches_per_sec' => $totalMatches / ($matchTime / 1000),
-        'total_matches' => $totalMatches,
+        'registration_ms'    => $regTime,
+        'matching_ms'        => $matchTime,
+        'matches_per_sec'    => $totalMatches / ($matchTime / 1000),
+        'total_matches'      => $totalMatches,
         'successful_matches' => $matched,
-        'memory_used' => $memUsed
+        'memory_used'        => $memAfterReg - $memBefore,
     ];
 }
 
-/**
- * Format number with thousands separator
- */
+// ============================================================================
+// Formatting Helpers
+// ============================================================================
+
 function formatNumber($num): string
 {
     return number_format($num, 0, '.', ',');
 }
 
-/**
- * Format time in milliseconds
- */
 function formatTime($ms): string
 {
     if ($ms < 1) {
@@ -345,9 +502,6 @@ function formatTime($ms): string
     return number_format($ms, 2) . ' ms';
 }
 
-/**
- * Format memory in bytes
- */
 function formatMemory($bytes): string
 {
     if ($bytes >= 1024 * 1024 * 1024) {
@@ -359,63 +513,88 @@ function formatMemory($bytes): string
     return number_format($bytes / 1024, 2) . ' KB';
 }
 
-// Run benchmarks
-echo "╔══════════════════════════════════════════════════════════════════════════════════════╗\n";
-echo "║                           ROUTER BENCHMARK COMPARISON                                ║\n";
-echo "╠══════════════════════════════════════════════════════════════════════════════════════╣\n";
-echo "║ Comparing: Signalforge (C ext) | Laravel | Symfony | FastRoute                       ║\n";
-echo "║ Iterations per test: " . str_pad(formatNumber($iterations), 62) . "║\n";
-echo "╚══════════════════════════════════════════════════════════════════════════════════════╝\n\n";
+// ============================================================================
+// Run Benchmarks
+// ============================================================================
 
-$markdown = "# Router Benchmark Results\n\n";
+echo "╔══════════════════════════════════════════════════════════════════════════════════════════════╗\n";
+echo "║                      ROUTER BENCHMARK - COMPLEX MULTI-PARAMETER ROUTES                     ║\n";
+echo "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
+echo "║ Comparing: Signalforge (C ext) | FastRoute | Symfony | Laravel                             ║\n";
+echo "║ Route complexity: 1-10 path parameters per route (tiers 3,5,7,9 have optional last param)  ║\n";
+echo "║ All parameters have numeric (\\d+) constraints                                              ║\n";
+echo "║ Iterations per test: " . str_pad(formatNumber($iterations), 68) . "║\n";
+echo "╚══════════════════════════════════════════════════════════════════════════════════════════════╝\n\n";
+
+$markdown = "# Router Benchmark Results — Complex Multi-Parameter Routes\n\n";
 $markdown .= "**Date:** " . date('Y-m-d H:i:s') . "\n";
 $markdown .= "**PHP Version:** " . PHP_VERSION . "\n";
 $markdown .= "**Iterations per test:** " . formatNumber($iterations) . "\n\n";
+$markdown .= "## Route Complexity\n\n";
+$markdown .= "Routes are distributed across 10 tiers with increasing parameter count:\n\n";
+$markdown .= "| Tier | Params | Optional | Example Pattern |\n";
+$markdown .= "|------|--------|----------|-----------------|\n";
+$markdown .= "| 1 | 1 | No | `/t1rN/items/{id}` |\n";
+$markdown .= "| 2 | 2 | No | `/t2rN/users/{userId}/posts/{postId}` |\n";
+$markdown .= "| 3 | 3 | Yes | `/t3rN/users/{userId}/posts/{postId}/comments/{commentId?}` |\n";
+$markdown .= "| 4 | 4 | No | `/t4rN/orgs/{orgId}/teams/{teamId}/projects/{projectId}/tasks/{taskId}` |\n";
+$markdown .= "| 5 | 5 | Yes | `/t5rN/.../tasks/{taskId}/sub/{subtaskId?}` |\n";
+$markdown .= "| 6 | 6 | No | `/t6rN/r/{regionId}/z/{zoneId}/.../v/{versionId}` |\n";
+$markdown .= "| 7 | 7 | Yes | `/t7rN/a/{p1}/b/{p2}/.../g/{p7?}` |\n";
+$markdown .= "| 8 | 8 | No | `/t8rN/a/{p1}/b/{p2}/.../h/{p8}` |\n";
+$markdown .= "| 9 | 9 | Yes | `/t9rN/a/{p1}/b/{p2}/.../i/{p9?}` |\n";
+$markdown .= "| 10 | 10 | No | `/t10rN/a/{p1}/b/{p2}/.../j/{p10}` |\n\n";
+$markdown .= "All parameters have `\\d+` (numeric) constraints. Test URIs match with all parameters filled in.\n\n";
+
+$routers = [
+    'Signalforge' => 'benchmarkSignalforge',
+    'FastRoute'   => 'benchmarkFastRoute',
+    'Symfony'     => 'benchmarkSymfony',
+    'Laravel'     => 'benchmarkLaravel',
+];
 
 foreach ($routeCounts as $routeCount) {
-    echo "┌────────────────────────────────────────────────────────────────────────────────────────┐\n";
-    echo "│ BENCHMARK: " . str_pad(formatNumber($routeCount) . " routes", 74) . "│\n";
-    echo "├────────────────────────────────────────────────────────────────────────────────────────┤\n";
+    echo "┌──────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+    echo "│ BENCHMARK: " . str_pad(formatNumber($routeCount) . " routes (distributed across 1-10 param tiers)", 80) . "│\n";
+    echo "├──────────────────────────────────────────────────────────────────────────────────────────────┤\n";
 
     $routes = generateRoutes($routeCount);
     $testUris = generateTestUris($routes);
 
+    $tierCounts = array_count_values(array_column($routes, 'tier'));
+    $tierSummary = [];
+    for ($t = 1; $t <= 10; $t++) {
+        if (isset($tierCounts[$t])) {
+            $tierSummary[] = "T{$t}:" . $tierCounts[$t];
+        }
+    }
+    echo "│ Tier distribution: " . str_pad(implode(' ', $tierSummary), 72) . "│\n";
+    echo "│ Test URIs: " . str_pad(count($testUris) . " unique URIs × {$iterations} iterations = " . formatNumber(count($testUris) * $iterations) . " matches", 80) . "│\n";
+    echo "├──────────────────────────────────────────────────────────────────────────────────────────────┤\n";
+
     $results[$routeCount] = [];
-
-    // Warmup
-    echo "│ Warming up...                                                                          │\n";
-
-    // Run benchmarks - skip slow routers for large route counts
-    $routers = [
-        'Signalforge' => 'benchmarkSignalforge',
-    ];
-
-    // FastRoute up to 20,000 routes
-    if ($routeCount <= 20000) {
-        $routers['FastRoute'] = 'benchmarkFastRoute';
-    }
-
-    // Only test Symfony/Laravel up to 10000 routes (they're too slow beyond that)
-    if ($routeCount <= 10000) {
-        $routers['Symfony'] = 'benchmarkSymfony';
-        $routers['Laravel'] = 'benchmarkLaravel';
-    }
 
     foreach ($routers as $name => $func) {
         gc_collect_cycles();
 
-        echo "│ Testing {$name}..." . str_repeat(' ', 73 - strlen($name)) . "│\r";
+        $label = "│ Testing {$name}...";
+        echo str_pad($label, 93) . "│\r";
+
         $results[$routeCount][$name] = $func($routes, $testUris, $iterations);
-        echo "│ Testing {$name}... Done" . str_repeat(' ', 68 - strlen($name)) . "│\n";
+
+        $data = $results[$routeCount][$name];
+        $label = "│ Testing {$name}... Done";
+        $matchInfo = "({$data['successful_matches']}/{$data['total_matches']} matched)";
+        echo str_pad($label, 50) . str_pad($matchInfo, 43) . "│\n";
     }
 
-    echo "├────────────────────────────────────────────────────────────────────────────────────────┤\n";
-    echo "│                                    RESULTS                                             │\n";
-    echo "├──────────────────┬───────────────┬───────────────┬───────────────┬────────────────────┤\n";
-    echo "│ Router           │ Registration  │ Matching      │ Matches/sec   │ Memory             │\n";
-    echo "├──────────────────┼───────────────┼───────────────┼───────────────┼────────────────────┤\n";
+    echo "├──────────────────────────────────────────────────────────────────────────────────────────────┤\n";
+    echo "│                                          RESULTS                                            │\n";
+    echo "├──────────────────┬───────────────┬───────────────┬───────────────┬──────────┬───────────────┤\n";
+    echo "│ Router           │ Registration  │ Matching      │ Matches/sec   │ Memory   │ Hit Rate      │\n";
+    echo "├──────────────────┼───────────────┼───────────────┼───────────────┼──────────┼───────────────┤\n";
 
-    // Find the fastest for comparison
+    // Find fastest for comparison
     $fastestMatch = PHP_FLOAT_MAX;
     foreach ($results[$routeCount] as $name => $data) {
         if ($data['matching_ms'] < $fastestMatch) {
@@ -424,179 +603,142 @@ foreach ($routeCounts as $routeCount) {
     }
 
     foreach ($results[$routeCount] as $name => $data) {
-        printf("│ %-16s │ %13s │ %13s │ %13s │ %18s │\n",
+        $hitRate = $data['total_matches'] > 0
+            ? number_format($data['successful_matches'] / $data['total_matches'] * 100, 1) . '%'
+            : 'N/A';
+
+        printf("│ %-16s │ %13s │ %13s │ %13s │ %8s │ %13s │\n",
             $name,
             formatTime($data['registration_ms']),
             formatTime($data['matching_ms']),
             formatNumber((int)$data['matches_per_sec']),
-            formatMemory($data['memory_used'])
+            formatMemory($data['memory_used']),
+            $hitRate
         );
     }
 
-    echo "└──────────────────┴───────────────┴───────────────┴───────────────┴────────────────────┘\n";
+    echo "└──────────────────┴───────────────┴───────────────┴───────────────┴──────────┴───────────────┘\n";
 
-    // Show speedup comparison
+    // Speed comparison
     echo "\n  Speed comparison (matching time):\n";
     foreach ($results[$routeCount] as $name => $data) {
         $speedup = $data['matching_ms'] / $fastestMatch;
         if ($speedup <= 1.01) {
             echo "  → {$name}: FASTEST\n";
         } else {
-            printf("  → %s: %.2fx slower\n", $name, $speedup);
+            printf("  → %s: %.1fx slower\n", $name, $speedup);
         }
     }
     echo "\n";
 
     // Build markdown table
     $markdown .= "## " . formatNumber($routeCount) . " Routes\n\n";
-    $markdown .= "| Router | Registration | Matching | Matches/sec | Memory |\n";
-    $markdown .= "|--------|-------------|----------|-------------|--------|\n";
+    $markdown .= "| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |\n";
+    $markdown .= "|--------|-------------|----------|-------------|--------|----------|\n";
 
     foreach ($results[$routeCount] as $name => $data) {
-        $markdown .= sprintf("| %s | %s | %s | %s | %s |\n",
+        $hitRate = $data['total_matches'] > 0
+            ? number_format($data['successful_matches'] / $data['total_matches'] * 100, 1) . '%'
+            : 'N/A';
+
+        $markdown .= sprintf("| %s | %s | %s | %s | %s | %s |\n",
             $name,
             formatTime($data['registration_ms']),
             formatTime($data['matching_ms']),
             formatNumber((int)$data['matches_per_sec']),
-            formatMemory($data['memory_used'])
+            formatMemory($data['memory_used']),
+            $hitRate
         );
     }
     $markdown .= "\n";
 }
 
-// Signalforge-only benchmarks for very large route counts
-foreach ($signalforgeOnlyRoutes as $routeCount) {
-    echo "┌────────────────────────────────────────────────────────────────────────────────────────┐\n";
-    echo "│ BENCHMARK: " . str_pad(formatNumber($routeCount) . " routes (Signalforge only)", 74) . "│\n";
-    echo "├────────────────────────────────────────────────────────────────────────────────────────┤\n";
-
-    $routes = generateRoutes($routeCount);
-    $testUris = generateTestUris($routes);
-
-    $results[$routeCount] = [];
-
-    echo "│ Warming up...                                                                          │\n";
-    gc_collect_cycles();
-
-    echo "│ Testing Signalforge..." . str_repeat(' ', 62) . "│\r";
-    $results[$routeCount]['Signalforge'] = benchmarkSignalforge($routes, $testUris, $iterations);
-    echo "│ Testing Signalforge... Done" . str_repeat(' ', 57) . "│\n";
-
-    echo "├────────────────────────────────────────────────────────────────────────────────────────┤\n";
-    echo "│                                    RESULTS                                             │\n";
-    echo "├──────────────────┬───────────────┬───────────────┬───────────────┬────────────────────┤\n";
-    echo "│ Router           │ Registration  │ Matching      │ Matches/sec   │ Memory             │\n";
-    echo "├──────────────────┼───────────────┼───────────────┼───────────────┼────────────────────┤\n";
-
-    $data = $results[$routeCount]['Signalforge'];
-    printf("│ %-16s │ %13s │ %13s │ %13s │ %18s │\n",
-        'Signalforge',
-        formatTime($data['registration_ms']),
-        formatTime($data['matching_ms']),
-        formatNumber((int)$data['matches_per_sec']),
-        formatMemory($data['memory_used'])
-    );
-
-    echo "└──────────────────┴───────────────┴───────────────┴───────────────┴────────────────────┘\n\n";
-
-    // Build markdown
-    $markdown .= "## " . formatNumber($routeCount) . " Routes (Signalforge Only)\n\n";
-    $markdown .= "| Router | Registration | Matching | Matches/sec | Memory |\n";
-    $markdown .= "|--------|-------------|----------|-------------|--------|\n";
-    $markdown .= sprintf("| %s | %s | %s | %s | %s |\n\n",
-        'Signalforge',
-        formatTime($data['registration_ms']),
-        formatTime($data['matching_ms']),
-        formatNumber((int)$data['matches_per_sec']),
-        formatMemory($data['memory_used'])
-    );
-}
-
+// ============================================================================
 // Summary
-echo "╔══════════════════════════════════════════════════════════════════════════════════════╗\n";
-echo "║                                    SUMMARY                                           ║\n";
-echo "╠══════════════════════════════════════════════════════════════════════════════════════╣\n";
+// ============================================================================
+
+echo "╔══════════════════════════════════════════════════════════════════════════════════════════════╗\n";
+echo "║                                        SUMMARY                                             ║\n";
+echo "╠══════════════════════════════════════════════════════════════════════════════════════════════╣\n";
 
 $markdown .= "## Summary\n\n";
 
-$allCounts = array_merge($routeCounts, $signalforgeOnlyRoutes);
-foreach ($allCounts as $routeCount) {
+foreach ($routeCounts as $routeCount) {
     $sfTime = $results[$routeCount]['Signalforge']['matching_ms'];
-    $sfMem = $results[$routeCount]['Signalforge']['memory_used'];
 
-    // Check if FastRoute was tested
-    if (isset($results[$routeCount]['FastRoute'])) {
-        $frTime = $results[$routeCount]['FastRoute']['matching_ms'];
-        $frMem = $results[$routeCount]['FastRoute']['memory_used'];
-        $winner = $sfTime <= $frTime ? "Signalforge" : "FastRoute";
-        $memRatio = $frMem > 0 ? $sfMem / $frMem : 0;
-
-        if (isset($results[$routeCount]['Laravel'])) {
-            $laTime = $results[$routeCount]['Laravel']['matching_ms'];
-            $speedupVsLaravel = $laTime / $sfTime;
-            printf("║ %7s routes: %-12s wins | SF vs Laravel: %7.1fx faster | Memory: %5.1f%% of FR ║\n",
-                formatNumber($routeCount), $winner, $speedupVsLaravel, $memRatio * 100);
-            $markdown .= sprintf("- **%s routes**: %s wins (Signalforge %.1fx faster than Laravel, uses %.1f%% memory of FastRoute)\n",
-                formatNumber($routeCount), $winner, $speedupVsLaravel, $memRatio * 100);
-        } else {
-            $speedupVsFr = $frTime / $sfTime;
-            printf("║ %7s routes: %-12s wins | SF vs FastRoute: %5.1fx faster | Memory: %5.1f%% of FR ║\n",
-                formatNumber($routeCount), $winner, $speedupVsFr, $memRatio * 100);
-            $markdown .= sprintf("- **%s routes**: %s wins (Signalforge %.1fx faster than FastRoute, uses %.1f%% memory of FastRoute)\n",
-                formatNumber($routeCount), $winner, $speedupVsFr, $memRatio * 100);
+    // Find slowest comparison router
+    $slowestName = null;
+    $slowestTime = 0;
+    foreach (['Laravel', 'Symfony', 'FastRoute'] as $comp) {
+        if (isset($results[$routeCount][$comp]) && $results[$routeCount][$comp]['matching_ms'] > $slowestTime) {
+            $slowestTime = $results[$routeCount][$comp]['matching_ms'];
+            $slowestName = $comp;
         }
-    } else {
-        // Signalforge only
-        printf("║ %7s routes: Signalforge only | %s matching | Memory: %18s ║\n",
-            formatNumber($routeCount), formatTime($sfTime), formatMemory($sfMem));
-        $markdown .= sprintf("- **%s routes**: Signalforge only (%s matching, %s memory)\n",
-            formatNumber($routeCount), formatTime($sfTime), formatMemory($sfMem));
+    }
+
+    if ($slowestName && $sfTime > 0) {
+        $speedup = $slowestTime / $sfTime;
+        printf("║ %7s routes: Signalforge %.1fx faster than %-12s │ SF: %13s │ %s: %13s ║\n",
+            formatNumber($routeCount),
+            $speedup,
+            $slowestName,
+            formatTime($sfTime),
+            str_pad($slowestName, 10),
+            formatTime($slowestTime)
+        );
+        $markdown .= sprintf("- **%s routes**: Signalforge %.1fx faster than %s (%s vs %s)\n",
+            formatNumber($routeCount),
+            $speedup,
+            $slowestName,
+            formatTime($sfTime),
+            formatTime($slowestTime)
+        );
     }
 }
 
-echo "╚══════════════════════════════════════════════════════════════════════════════════════╝\n";
+echo "╚══════════════════════════════════════════════════════════════════════════════════════════════╝\n";
 
-// Memory comparison table
+// Memory comparison
 echo "\n";
-echo "┌────────────────────────────────────────────────────────────────────────────────────────┐\n";
-echo "│                              MEMORY USAGE COMPARISON                                   │\n";
-echo "├──────────────────┬──────────────┬──────────────┬──────────────┬──────────────┬────────┤\n";
-echo "│ Routes           │ Signalforge  │ FastRoute    │ Symfony      │ Laravel      │ SF/FR  │\n";
-echo "├──────────────────┼──────────────┼──────────────┼──────────────┼──────────────┼────────┤\n";
+echo "┌──────────────────────────────────────────────────────────────────────────────────────────────┐\n";
+echo "│                                  MEMORY USAGE COMPARISON                                    │\n";
+echo "├──────────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┤\n";
+echo "│ Routes           │ Signalforge  │ FastRoute    │ Symfony      │ Laravel      │ SF/FR Ratio  │\n";
+echo "├──────────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤\n";
 
 $markdown .= "\n## Memory Usage Comparison\n\n";
 $markdown .= "| Routes | Signalforge | FastRoute | Symfony | Laravel | SF/FR Ratio |\n";
 $markdown .= "|--------|-------------|-----------|---------|---------|-------------|\n";
 
-foreach ($allCounts as $routeCount) {
+foreach ($routeCounts as $routeCount) {
     $sf = formatMemory($results[$routeCount]['Signalforge']['memory_used']);
     $fr = isset($results[$routeCount]['FastRoute']) ? formatMemory($results[$routeCount]['FastRoute']['memory_used']) : 'N/A';
     $sy = isset($results[$routeCount]['Symfony']) ? formatMemory($results[$routeCount]['Symfony']['memory_used']) : 'N/A';
     $la = isset($results[$routeCount]['Laravel']) ? formatMemory($results[$routeCount]['Laravel']['memory_used']) : 'N/A';
-    $ratio = isset($results[$routeCount]['FastRoute']) && $results[$routeCount]['FastRoute']['memory_used'] > 0
-        ? $results[$routeCount]['Signalforge']['memory_used'] / $results[$routeCount]['FastRoute']['memory_used']
-        : 0;
 
+    $frMem = $results[$routeCount]['FastRoute']['memory_used'] ?? 0;
+    $sfMem = $results[$routeCount]['Signalforge']['memory_used'];
+    $ratio = $frMem > 0 ? $sfMem / $frMem : 0;
     $ratioStr = $ratio > 0 ? sprintf("%5.1f%%", $ratio * 100) : "N/A";
 
-    printf("│ %16s │ %12s │ %12s │ %12s │ %12s │ %6s │\n",
+    printf("│ %16s │ %12s │ %12s │ %12s │ %12s │ %12s │\n",
         formatNumber($routeCount), $sf, $fr, $sy, $la, $ratioStr);
 
     $markdown .= sprintf("| %s | %s | %s | %s | %s | %s |\n",
         formatNumber($routeCount), $sf, $fr, $sy, $la, $ratioStr);
 }
 
-echo "└──────────────────┴──────────────┴──────────────┴──────────────┴──────────────┴────────┘\n";
+echo "└──────────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘\n";
 
 // Write markdown file
 $markdown .= "\n### Notes\n\n";
-$markdown .= "- All routers were tested with the same routes and URIs\n";
-$markdown .= "- Routes include parameter constraints (`{id}` with numeric validation)\n";
-$markdown .= "- Matching includes both static and parameterized routes\n";
-$markdown .= "- Memory shows router-specific memory usage (after registration)\n";
-$markdown .= "- Symfony and Laravel benchmarks skipped for >10,000 routes due to excessive time\n";
-$markdown .= "- FastRoute benchmarks skipped for >20,000 routes due to excessive time\n";
-$markdown .= "- 100,000 routes tested only with Signalforge (other routers too slow)\n";
+$markdown .= "- All routers tested with identical route patterns and matching URIs\n";
+$markdown .= "- Routes distributed evenly across 10 complexity tiers (1-10 path parameters)\n";
+$markdown .= "- Tiers 3, 5, 7, 9 include an optional trailing parameter\n";
+$markdown .= "- All parameters have numeric (`\\d+`) constraints\n";
+$markdown .= "- Test URIs always include all parameters (including optional) for fair matching comparison\n";
+$markdown .= "- Memory shows router-specific memory delta after route registration\n";
+$markdown .= "- Hit Rate shows percentage of successful matches out of total attempts\n";
 
 file_put_contents(__DIR__ . '/../benchmark.md', $markdown);
 echo "\nResults saved to benchmark.md\n";

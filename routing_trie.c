@@ -2502,7 +2502,8 @@ static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
             zval val;
             ZVAL_STR(&val, val_str);
             sf_route_set_default(route, key, &val);
-            /* val_str is now owned by defaults table */
+            /* sf_route_set_default does ZVAL_COPY, so release our reference */
+            zend_string_release(val_str);
         } else {
             if (val_str) zend_string_release(val_str);
         }
