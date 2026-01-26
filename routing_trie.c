@@ -39,22 +39,7 @@
 sf_trie_node *sf_trie_node_create(sf_node_type type)
 {
     sf_trie_node *node = ecalloc(1, sizeof(sf_trie_node));
-    if (!node) {
-        return NULL;
-    }
-
     node->type = type;
-    node->segment = NULL;
-    node->param_name = NULL;
-    node->constraint = NULL;
-    node->static_children = NULL;
-    node->param_child = NULL;
-    node->optional_child = NULL;
-    node->wildcard_child = NULL;
-    node->route = NULL;
-    node->is_terminal = 0;
-    node->depth = 0;
-
     return node;
 }
 
@@ -140,62 +125,34 @@ static void sf_ht_trie_node_dtor(zval *zv)
 sf_route *sf_route_create(void)
 {
     sf_route *route = ecalloc(1, sizeof(sf_route));
-    if (!route) {
-        return NULL;
-    }
-
-    route->uri = NULL;
-    route->name = NULL;
     ZVAL_UNDEF(&route->handler);
-    route->middleware_head = NULL;
-    route->middleware_tail = NULL;
-    route->middleware_count = 0;
-    route->wheres = NULL;
-    route->defaults = NULL;
-    route->method = SF_METHOD_GET;
-    route->domain = NULL;
-    route->domain_regex = NULL;
-    route->priority = 0;
-    route->is_fallback = 0;
-    route->php_object = NULL;
     route->refcount = 1;
-
     return route;
 }
 
-/**
- * Increment route reference count atomically.
- *
- * Uses atomic operations in ZTS builds to prevent race conditions when
- * multiple threads access the same route simultaneously. In non-ZTS builds,
- * we still use atomics as they are cheap on modern CPUs and provide
- * consistency.
- *
- * Memory ordering: RELAXED is sufficient for increment since we only need
- * the increment itself to be atomic; no other memory operations depend on it.
- */
 void sf_route_addref(sf_route *route)
 {
     if (route) {
+#ifdef ZTS
         __atomic_add_fetch(&route->refcount, 1, __ATOMIC_RELAXED);
+#else
+        route->refcount++;
+#endif
     }
 }
 
-/**
- * Decrement route reference count atomically and destroy if zero.
- *
- * Memory ordering: ACQ_REL (acquire-release) is required because:
- * - RELEASE: Ensures all previous writes to the route are visible before
- *   the decrement, so another thread that sees refcount==0 sees a consistent state
- * - ACQUIRE: If we get refcount==0, we need to see all writes from other threads
- *   that released their references before we free the memory
- */
 void sf_route_release(sf_route *route)
 {
     if (route) {
+#ifdef ZTS
         if (__atomic_sub_fetch(&route->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
             sf_route_destroy(route);
         }
+#else
+        if (--route->refcount == 0) {
+            sf_route_destroy(route);
+        }
+#endif
     }
 }
 
@@ -247,19 +204,8 @@ void sf_route_destroy(sf_route *route)
 sf_param_constraint *sf_constraint_create(zend_string *name)
 {
     sf_param_constraint *constraint = ecalloc(1, sizeof(sf_param_constraint));
-    if (!constraint) {
-        return NULL;
-    }
-
     constraint->name = zend_string_copy(name);
-    constraint->pattern = NULL;
-    constraint->compiled_regex = NULL;
-    constraint->match_data = NULL;
     ZVAL_UNDEF(&constraint->default_value);
-    constraint->validator = SF_VALIDATOR_REGEX;  /* Default to regex validation */
-    constraint->has_default = 0;
-    constraint->is_optional = 0;
-
     return constraint;
 }
 
@@ -279,10 +225,6 @@ void sf_constraint_destroy(sf_param_constraint *constraint)
 
     if (constraint->compiled_regex) {
         pcre2_code_free(constraint->compiled_regex);
-    }
-
-    if (constraint->match_data) {
-        pcre2_match_data_free(constraint->match_data);
     }
 
     if (!Z_ISUNDEF(constraint->default_value)) {
@@ -327,11 +269,11 @@ static sf_validator_type sf_detect_validator_type(const char *pattern, size_t le
     if (len == 14 && memcmp(pattern, "[a-zA-Z0-9_-]+", 14) == 0) {
         return SF_VALIDATOR_SLUG;
     }
-    /* UUID pattern - common regex format */
-    if (len >= 30 && strstr(pattern, "[0-9a-fA-F]") != NULL &&
-        strstr(pattern, "-") != NULL) {
-        /* Rough UUID pattern detection - if it looks like a UUID regex */
-        if (strstr(pattern, "{8}") && strstr(pattern, "{4}") && strstr(pattern, "{12}")) {
+    /* UUID pattern - exact match of common regex format */
+    {
+        static const char uuid_pat[] =
+            "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+        if (len == sizeof(uuid_pat) - 1 && memcmp(pattern, uuid_pat, len) == 0) {
             return SF_VALIDATOR_UUID;
         }
     }
@@ -365,11 +307,6 @@ zend_bool sf_constraint_set_pattern(sf_param_constraint *constraint, zend_string
         constraint->compiled_regex = NULL;
     }
 
-    if (constraint->match_data) {
-        pcre2_match_data_free(constraint->match_data);
-        constraint->match_data = NULL;
-    }
-
     /* Reset validator to default */
     constraint->validator = SF_VALIDATOR_REGEX;
 
@@ -380,8 +317,6 @@ zend_bool sf_constraint_set_pattern(sf_param_constraint *constraint, zend_string
         /* Use specialized validator - skip PCRE2 compilation entirely */
         constraint->validator = validator_type;
         constraint->pattern = zend_string_copy(pattern);
-        constraint->compiled_regex = NULL;
-        constraint->match_data = NULL;
         return 1;
     }
 
@@ -415,11 +350,6 @@ zend_bool sf_constraint_set_pattern(sf_param_constraint *constraint, zend_string
 
     /* JIT compile for performance */
     pcre2_jit_compile(constraint->compiled_regex, PCRE2_JIT_COMPLETE);
-
-    /* Create match data */
-    constraint->match_data = pcre2_match_data_create_from_pattern(
-        constraint->compiled_regex, NULL
-    );
 
     constraint->pattern = zend_string_copy(pattern);
     smart_str_free(&full_pattern);
@@ -584,18 +514,30 @@ zend_bool sf_constraint_validate(sf_param_constraint *constraint, zend_string *v
                 return 1; /* No pattern means always valid */
             }
 
-            int rc = pcre2_match(
-                constraint->compiled_regex,
-                (PCRE2_SPTR)str,
-                len,
-                0,
-                0,
-                constraint->match_data,
-                NULL
-            );
+            {
+                /* Allocate match_data per-call for thread safety */
+                pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(
+                    constraint->compiled_regex, NULL
+                );
+                if (UNEXPECTED(!match_data)) {
+                    return 0;
+                }
 
-            /* Most validation should succeed */
-            return EXPECTED(rc >= 0);
+                int rc = pcre2_match(
+                    constraint->compiled_regex,
+                    (PCRE2_SPTR)str,
+                    len,
+                    0,
+                    0,
+                    match_data,
+                    NULL
+                );
+
+                pcre2_match_data_free(match_data);
+
+                /* Most validation should succeed */
+                return EXPECTED(rc >= 0);
+            }
     }
 }
 
@@ -606,14 +548,8 @@ zend_bool sf_constraint_validate(sf_param_constraint *constraint, zend_string *v
 sf_middleware_entry *sf_middleware_create(zend_string *name)
 {
     sf_middleware_entry *entry = ecalloc(1, sizeof(sf_middleware_entry));
-    if (!entry) {
-        return NULL;
-    }
-
     entry->name = zend_string_copy(name);
     ZVAL_UNDEF(&entry->parameters);
-    entry->next = NULL;
-
     return entry;
 }
 
@@ -682,17 +618,10 @@ sf_middleware_entry *sf_middleware_list_clone(sf_middleware_entry *head)
 sf_router *sf_router_create(void)
 {
     sf_router *router = ecalloc(1, sizeof(sf_router));
-    if (!router) {
-        return NULL;
-    }
 
     /* Initialize method tries */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
         router->method_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
-        if (!router->method_tries[i]) {
-            sf_router_destroy(router);
-            return NULL;
-        }
     }
 
     /* Initialize named routes hash table */
@@ -703,14 +632,7 @@ sf_router *sf_router_create(void)
     ALLOC_HASHTABLE(router->all_routes);
     zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
-    router->current_group = NULL;
-    router->fallback_route = NULL;
-    router->is_immutable = 0;
-    router->trailing_slash_strict = 0;
-    router->route_count = 0;
-
 #ifdef ZTS
-    /* Initialize read-write lock for thread-safe access */
 #ifdef _WIN32
     InitializeSRWLock(&router->lock);
 #else
@@ -743,6 +665,11 @@ void sf_router_destroy(sf_router *router)
     if (router->all_routes) {
         zend_hash_destroy(router->all_routes);
         FREE_HASHTABLE(router->all_routes);
+    }
+
+    /* Release fallback route if exists */
+    if (router->fallback_route) {
+        sf_route_release(router->fallback_route);
     }
 
     /* Destroy any remaining group context */
@@ -821,13 +748,6 @@ void sf_router_reset(sf_router *router)
 sf_match_result *sf_match_result_create(void)
 {
     sf_match_result *result = ecalloc(1, sizeof(sf_match_result));
-    if (!result) {
-        return NULL;
-    }
-
-    result->route = NULL;
-    result->matched = 0;
-    result->error = NULL;
 
     ALLOC_HASHTABLE(result->params);
     zend_hash_init(result->params, SF_PARAMS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
@@ -859,21 +779,7 @@ void sf_match_result_destroy(sf_match_result *result)
 
 sf_route_group *sf_route_group_create(void)
 {
-    sf_route_group *group = ecalloc(1, sizeof(sf_route_group));
-    if (!group) {
-        return NULL;
-    }
-
-    group->prefix = NULL;
-    group->namespace = NULL;
-    group->name_prefix = NULL;
-    group->domain = NULL;
-    group->middleware_head = NULL;
-    group->middleware_tail = NULL;
-    group->wheres = NULL;
-    group->parent = NULL;
-
-    return group;
+    return ecalloc(1, sizeof(sf_route_group));
 }
 
 void sf_route_group_destroy(sf_route_group *group)
@@ -934,15 +840,6 @@ sf_uri_segment *sf_parse_uri(const char *uri, size_t len)
     while (ptr < end) {
         const char *seg_start = ptr;
         sf_uri_segment *segment = ecalloc(1, sizeof(sf_uri_segment));
-        if (!segment) {
-            sf_uri_segments_destroy(head);
-            return NULL;
-        }
-
-        segment->type = SF_NODE_STATIC;
-        segment->is_optional = 0;
-        segment->param_name = NULL;
-        segment->next = NULL;
 
         /* Check for parameter segment */
         if (*ptr == '{') {
@@ -1302,6 +1199,12 @@ void sf_route_add_middleware(sf_route *route, zend_string *name, zval *params)
         return;
     }
 
+    if (route->middleware_count >= SF_MAX_MIDDLEWARE_COUNT) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Maximum middleware count (%d) exceeded", SF_MAX_MIDDLEWARE_COUNT);
+        return;
+    }
+
     entry = sf_middleware_create(name);
     if (!entry) {
         return;
@@ -1648,52 +1551,6 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
  * ============================================================================ */
 
 /**
- * Optimized hash table lookup with pre-computed hash.
- *
- * This function performs a hash table lookup using a raw string (char*, len)
- * by computing the hash once and doing direct bucket access. This is faster
- * than zend_hash_str_find() for our use case because:
- * 1. We compute the hash inline using the fast DJBX33A algorithm
- * 2. We can compare the pre-computed child segment_hash first (integer compare)
- * 3. String comparison only happens on hash match (collision resolution)
- *
- * Returns the child node pointer, or NULL if not found.
- */
-static zend_always_inline sf_trie_node *sf_hash_find_child(
-    HashTable *ht, const char *str, size_t len)
-{
-    zend_ulong h;
-    uint32_t nIndex;
-    uint32_t idx;
-    Bucket *p;
-    sf_trie_node *child;
-
-    /* Compute hash using PHP's DJBX33A algorithm */
-    h = zend_inline_hash_func(str, len);
-
-    /* Direct bucket access using computed hash */
-    nIndex = h | ht->nTableMask;
-    idx = HT_HASH(ht, nIndex);
-
-    while (idx != HT_INVALID_IDX) {
-        p = HT_HASH_TO_BUCKET(ht, idx);
-
-        /* First compare hash (fast integer compare) */
-        if (p->h == h) {
-            /* Hash match - now compare the actual key string */
-            if (p->key && ZSTR_LEN(p->key) == len &&
-                memcmp(ZSTR_VAL(p->key), str, len) == 0) {
-                /* Found! Extract the child node pointer */
-                return (sf_trie_node *)Z_PTR(p->val);
-            }
-        }
-        idx = Z_NEXT(p->val);
-    }
-
-    return NULL;
-}
-
-/**
  * Find terminal node through chain of optional children
  * Used when path is exhausted but we may have optional params with defaults
  */
@@ -1728,6 +1585,10 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
                                             HashTable *params,
                                             size_t depth)
 {
+    if (UNEXPECTED(depth > SF_MAX_TRIE_DEPTH)) {
+        return NULL;
+    }
+
     const char *ptr = path;
     const char *end = path + path_len;
 
@@ -1766,12 +1627,8 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
 
     /* 1. Try static children first (most common case - routes like /api/users/list) */
     if (EXPECTED(node->static_children != NULL)) {
-        /*
-         * Use optimized hash lookup with direct bucket access.
-         * sf_hash_find_child() computes the hash once and does direct bucket
-         * traversal, which is faster than zend_hash_str_find() for our use case.
-         */
-        sf_trie_node *child = sf_hash_find_child(node->static_children, seg_start, seg_len);
+        zval *child_zv = zend_hash_str_find(node->static_children, seg_start, seg_len);
+        sf_trie_node *child = child_zv ? (sf_trie_node *)Z_PTR_P(child_zv) : NULL;
 
         if (EXPECTED(child != NULL)) {
             result = sf_trie_match_internal(child, remaining, remaining_len, params, depth + 1);
@@ -2147,6 +2004,10 @@ zend_bool sf_router_has_route(sf_router *router, zend_string *name)
     return exists;
 }
 
+/**
+ * Get route by name. Returns an owned reference that the caller must release
+ * with sf_route_release() when done.
+ */
 sf_route *sf_router_get_route(sf_router *router, zend_string *name)
 {
     sf_route *route = NULL;
@@ -2155,16 +2016,11 @@ sf_route *sf_router_get_route(sf_router *router, zend_string *name)
         return NULL;
     }
 
-    /* Read lock: getting route is read-only */
     SF_ROUTER_RDLOCK(router);
     zval *route_zv = zend_hash_find(router->named_routes, name);
     if (route_zv) {
         route = (sf_route *)Z_PTR_P(route_zv);
-        /*
-         * Note: In ZTS builds, the caller should ensure the route remains
-         * valid after this call. For safety, we could add a reference here
-         * but that would require the caller to release it.
-         */
+        sf_route_addref(route);
     }
     SF_ROUTER_UNLOCK_RD(router);
 
@@ -2341,6 +2197,11 @@ static void sf_buf_write_bytes(sf_write_buffer *buf, const char *data, size_t le
 static void sf_buf_write_string(sf_write_buffer *buf, zend_string *str)
 {
     if (str && ZSTR_LEN(str) > 0) {
+        if (UNEXPECTED(ZSTR_LEN(str) > 65535)) {
+            php_error_docref(NULL, E_WARNING,
+                "Signalforge\\Routing: String truncated during serialization "
+                "(length %zu exceeds 65535 byte limit)", ZSTR_LEN(str));
+        }
         uint16_t len = (uint16_t)(ZSTR_LEN(str) > 65535 ? 65535 : ZSTR_LEN(str));
         sf_buf_write_u16(buf, len);
         sf_buf_write_bytes(buf, ZSTR_VAL(str), len);
@@ -2589,6 +2450,10 @@ static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
     /* Method */
     uint8_t method;
     if (!sf_buf_read_u8(buf, &method)) {
+        sf_route_destroy(route);
+        return NULL;
+    }
+    if (method >= SF_METHOD_COUNT) {
         sf_route_destroy(route);
         return NULL;
     }
@@ -2911,7 +2776,11 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
     zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
 #ifdef ZTS
-    router->lock = tsrm_mutex_alloc();
+#ifdef _WIN32
+    InitializeSRWLock(&router->lock);
+#else
+    pthread_rwlock_init(&router->lock, NULL);
+#endif
 #endif
 
     /* Deserialize each method trie */

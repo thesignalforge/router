@@ -117,6 +117,10 @@ static sf_router *sf_get_global_router(void)
     return SF_G(global_router);
 }
 
+/**
+ * Wrap a route in a PHP Route object. Takes ownership of an existing reference
+ * (the caller's ref is transferred to the PHP object — do NOT release after calling).
+ */
 static sf_route_object *sf_wrap_route(sf_route *route)
 {
     if (!route) {
@@ -127,7 +131,6 @@ static sf_route_object *sf_wrap_route(sf_route *route)
     object_init_ex(&rv, sf_route_ce);
     sf_route_object *obj = Z_ROUTE_OBJ_P(&rv);
     obj->route = route;
-    sf_route_addref(route);
     route->php_object = Z_OBJ(rv);
 
     return obj;
@@ -171,11 +174,12 @@ static void sf_router_register_method(INTERNAL_FUNCTION_PARAMETERS, sf_http_meth
         RETURN_THROWS();
     }
 
-    /* Return Route object for chaining */
+    /* Return Route object for chaining.
+     * The route starts with refcount=1 from sf_route_create — this serves as
+     * the PHP object's reference. The trie added its own ref via sf_trie_insert. */
     object_init_ex(return_value, sf_route_ce);
     sf_route_object *route_obj = Z_ROUTE_OBJ_P(return_value);
     route_obj->route = route;
-    sf_route_addref(route);
     route->php_object = Z_OBJ_P(return_value);
 }
 
@@ -353,16 +357,10 @@ PHP_METHOD(Signalforge_Routing_Router, prefix)
         Z_PARAM_STR(prefix)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* Create a group with just prefix and return $this for chaining */
-    sf_router *router = sf_get_global_router();
-    sf_route_group *group = sf_route_group_create();
+    php_error_docref(NULL, E_WARNING,
+        "Signalforge\\Routing: Router::prefix() without group() has no effect. "
+        "Use Router::group(['prefix' => '...'], callback) instead");
 
-    if (group) {
-        group->prefix = zend_string_copy(prefix);
-        sf_router_begin_group(router, group);
-    }
-
-    /* Return self (the class) for chaining */
     RETURN_NULL();
 }
 
@@ -374,35 +372,9 @@ PHP_METHOD(Signalforge_Routing_Router, middleware)
         Z_PARAM_ZVAL(middleware)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
-    sf_route_group *group = sf_route_group_create();
-
-    if (group) {
-        if (Z_TYPE_P(middleware) == IS_ARRAY) {
-            zval *mw;
-            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(middleware), mw) {
-                if (Z_TYPE_P(mw) == IS_STRING) {
-                    sf_middleware_entry *entry = sf_middleware_create(Z_STR_P(mw));
-                    if (entry) {
-                        if (!group->middleware_head) {
-                            group->middleware_head = entry;
-                            group->middleware_tail = entry;
-                        } else {
-                            group->middleware_tail->next = entry;
-                            group->middleware_tail = entry;
-                        }
-                    }
-                }
-            } ZEND_HASH_FOREACH_END();
-        } else if (Z_TYPE_P(middleware) == IS_STRING) {
-            sf_middleware_entry *entry = sf_middleware_create(Z_STR_P(middleware));
-            if (entry) {
-                group->middleware_head = entry;
-                group->middleware_tail = entry;
-            }
-        }
-        sf_router_begin_group(router, group);
-    }
+    php_error_docref(NULL, E_WARNING,
+        "Signalforge\\Routing: Router::middleware() without group() has no effect. "
+        "Use Router::group(['middleware' => [...]], callback) instead");
 
     RETURN_NULL();
 }
@@ -415,13 +387,9 @@ PHP_METHOD(Signalforge_Routing_Router, domain)
         Z_PARAM_STR(domain)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
-    sf_route_group *group = sf_route_group_create();
-
-    if (group) {
-        group->domain = zend_string_copy(domain);
-        sf_router_begin_group(router, group);
-    }
+    php_error_docref(NULL, E_WARNING,
+        "Signalforge\\Routing: Router::domain() without group() has no effect. "
+        "Use Router::group(['domain' => '...'], callback) instead");
 
     RETURN_NULL();
 }
@@ -434,13 +402,9 @@ PHP_METHOD(Signalforge_Routing_Router, namespace_)
         Z_PARAM_STR(ns)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
-    sf_route_group *group = sf_route_group_create();
-
-    if (group) {
-        group->namespace = zend_string_copy(ns);
-        sf_router_begin_group(router, group);
-    }
+    php_error_docref(NULL, E_WARNING,
+        "Signalforge\\Routing: Router::namespace() without group() has no effect. "
+        "Use Router::group(['namespace' => '...'], callback) instead");
 
     RETURN_NULL();
 }
@@ -453,13 +417,9 @@ PHP_METHOD(Signalforge_Routing_Router, name)
         Z_PARAM_STR(name)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
-    sf_route_group *group = sf_route_group_create();
-
-    if (group) {
-        group->name_prefix = zend_string_copy(name);
-        sf_router_begin_group(router, group);
-    }
+    php_error_docref(NULL, E_WARNING,
+        "Signalforge\\Routing: Router::name() without group() has no effect. "
+        "Use Router::group(['as' => '...'], callback) instead");
 
     RETURN_NULL();
 }
@@ -491,11 +451,13 @@ PHP_METHOD(Signalforge_Routing_Router, fallback)
     }
     router->fallback_route = route;
 
-    /* Return Route object for chaining */
+    /* Return Route object for chaining.
+     * The fallback route's initial refcount=1 is the PHP object's reference.
+     * The router->fallback_route pointer also needs a ref. */
+    sf_route_addref(route);
     object_init_ex(return_value, sf_route_ce);
     sf_route_object *route_obj = Z_ROUTE_OBJ_P(return_value);
     route_obj->route = route;
-    sf_route_addref(route);
 }
 
 PHP_METHOD(Signalforge_Routing_Router, url)
@@ -753,7 +715,12 @@ PHP_METHOD(Signalforge_Routing_Route, where)
     RETURN_ZVAL(ZEND_THIS, 1, 0);
 }
 
-PHP_METHOD(Signalforge_Routing_Route, whereNumber)
+/**
+ * Helper: Apply a fixed constraint pattern to one or more params.
+ * Accepts params as string (single) or array (multiple).
+ */
+static void sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAMETERS,
+                                         const char *pat, size_t pat_len)
 {
     zval *params;
 
@@ -767,7 +734,7 @@ PHP_METHOD(Signalforge_Routing_Route, whereNumber)
         RETURN_NULL();
     }
 
-    zend_string *pattern = zend_string_init("[0-9]+", sizeof("[0-9]+") - 1, 0);
+    zend_string *pattern = zend_string_init(pat, pat_len, 0);
 
     if (Z_TYPE_P(params) == IS_ARRAY) {
         zval *param;
@@ -782,138 +749,38 @@ PHP_METHOD(Signalforge_Routing_Route, whereNumber)
 
     zend_string_release(pattern);
     RETURN_ZVAL(ZEND_THIS, 1, 0);
+}
+
+PHP_METHOD(Signalforge_Routing_Route, whereNumber)
+{
+    sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+        "[0-9]+", sizeof("[0-9]+") - 1);
 }
 
 PHP_METHOD(Signalforge_Routing_Route, whereAlpha)
 {
-    zval *params;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(params)
-    ZEND_PARSE_PARAMETERS_END();
-
-    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
-    if (!intern->route) {
-        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
-    }
-
-    zend_string *pattern = zend_string_init("[a-zA-Z]+", sizeof("[a-zA-Z]+") - 1, 0);
-
-    if (Z_TYPE_P(params) == IS_ARRAY) {
-        zval *param;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(params), param) {
-            if (Z_TYPE_P(param) == IS_STRING) {
-                sf_route_set_where(intern->route, Z_STR_P(param), pattern);
-            }
-        } ZEND_HASH_FOREACH_END();
-    } else if (Z_TYPE_P(params) == IS_STRING) {
-        sf_route_set_where(intern->route, Z_STR_P(params), pattern);
-    }
-
-    zend_string_release(pattern);
-    RETURN_ZVAL(ZEND_THIS, 1, 0);
+    sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+        "[a-zA-Z]+", sizeof("[a-zA-Z]+") - 1);
 }
 
 PHP_METHOD(Signalforge_Routing_Route, whereAlphaNumeric)
 {
-    zval *params;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(params)
-    ZEND_PARSE_PARAMETERS_END();
-
-    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
-    if (!intern->route) {
-        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
-    }
-
-    zend_string *pattern = zend_string_init("[a-zA-Z0-9]+", sizeof("[a-zA-Z0-9]+") - 1, 0);
-
-    if (Z_TYPE_P(params) == IS_ARRAY) {
-        zval *param;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(params), param) {
-            if (Z_TYPE_P(param) == IS_STRING) {
-                sf_route_set_where(intern->route, Z_STR_P(param), pattern);
-            }
-        } ZEND_HASH_FOREACH_END();
-    } else if (Z_TYPE_P(params) == IS_STRING) {
-        sf_route_set_where(intern->route, Z_STR_P(params), pattern);
-    }
-
-    zend_string_release(pattern);
-    RETURN_ZVAL(ZEND_THIS, 1, 0);
+    sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+        "[a-zA-Z0-9]+", sizeof("[a-zA-Z0-9]+") - 1);
 }
 
 PHP_METHOD(Signalforge_Routing_Route, whereUuid)
 {
-    zval *params;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(params)
-    ZEND_PARSE_PARAMETERS_END();
-
-    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
-    if (!intern->route) {
-        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
-    }
-
-    zend_string *pattern = zend_string_init(
+    sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAM_PASSTHRU,
         "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-        sizeof("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}") - 1,
-        0
-    );
-
-    if (Z_TYPE_P(params) == IS_ARRAY) {
-        zval *param;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(params), param) {
-            if (Z_TYPE_P(param) == IS_STRING) {
-                sf_route_set_where(intern->route, Z_STR_P(param), pattern);
-            }
-        } ZEND_HASH_FOREACH_END();
-    } else if (Z_TYPE_P(params) == IS_STRING) {
-        sf_route_set_where(intern->route, Z_STR_P(params), pattern);
-    }
-
-    zend_string_release(pattern);
-    RETURN_ZVAL(ZEND_THIS, 1, 0);
+        sizeof("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}") - 1);
 }
 
 PHP_METHOD(Signalforge_Routing_Route, whereUlid)
 {
-    zval *params;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(params)
-    ZEND_PARSE_PARAMETERS_END();
-
-    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
-    if (!intern->route) {
-        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
-    }
-
-    zend_string *pattern = zend_string_init(
+    sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAM_PASSTHRU,
         "[0-7][0-9A-HJKMNP-TV-Z]{25}",
-        sizeof("[0-7][0-9A-HJKMNP-TV-Z]{25}") - 1,
-        0
-    );
-
-    if (Z_TYPE_P(params) == IS_ARRAY) {
-        zval *param;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(params), param) {
-            if (Z_TYPE_P(param) == IS_STRING) {
-                sf_route_set_where(intern->route, Z_STR_P(param), pattern);
-            }
-        } ZEND_HASH_FOREACH_END();
-    } else if (Z_TYPE_P(params) == IS_STRING) {
-        sf_route_set_where(intern->route, Z_STR_P(params), pattern);
-    }
-
-    zend_string_release(pattern);
-    RETURN_ZVAL(ZEND_THIS, 1, 0);
+        sizeof("[0-7][0-9A-HJKMNP-TV-Z]{25}") - 1);
 }
 
 PHP_METHOD(Signalforge_Routing_Route, whereIn)
