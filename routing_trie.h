@@ -96,7 +96,6 @@ typedef struct _sf_param_constraint {
     zend_string *name;              /* Parameter name */
     zend_string *pattern;           /* Original regex pattern */
     pcre2_code *compiled_regex;     /* Compiled PCRE2 regex (NULL if specialized) */
-    pcre2_match_data *match_data;   /* Reusable match data */
     zval default_value;             /* Default value for optional params */
     sf_validator_type validator;    /* Specialized validator type */
     zend_bool has_default;          /* Whether default is set */
