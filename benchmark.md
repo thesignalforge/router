@@ -1,95 +1,97 @@
-# Router Benchmark Results
+# Router Benchmark Results — Complex Multi-Parameter Routes
 
-**Date:** 2026-01-13 21:27:17
-**PHP Version:** 8.4.16
+**Date:** 2026-01-26 23:35:04
+**PHP Version:** 8.4.17
 **Iterations per test:** 1,000
 
-## 1 Routes
+## Route Complexity
 
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 31.95 µs | 1.02 ms | 6,856,638 | 0.00 KB |
-| FastRoute | 648.98 µs | 1.03 ms | 6,769,685 | 0.00 KB |
-| Symfony | 235.08 µs | 13.40 ms | 522,199 | 0.00 KB |
-| Laravel | 2.09 ms | 62.57 ms | 111,873 | 2.00 MB |
+Routes are distributed across 10 tiers with increasing parameter count:
+
+| Tier | Params | Optional | Example Pattern |
+|------|--------|----------|-----------------|
+| 1 | 1 | No | `/t1rN/items/{id}` |
+| 2 | 2 | No | `/t2rN/users/{userId}/posts/{postId}` |
+| 3 | 3 | Yes | `/t3rN/users/{userId}/posts/{postId}/comments/{commentId?}` |
+| 4 | 4 | No | `/t4rN/orgs/{orgId}/teams/{teamId}/projects/{projectId}/tasks/{taskId}` |
+| 5 | 5 | Yes | `/t5rN/.../tasks/{taskId}/sub/{subtaskId?}` |
+| 6 | 6 | No | `/t6rN/r/{regionId}/z/{zoneId}/.../v/{versionId}` |
+| 7 | 7 | Yes | `/t7rN/a/{p1}/b/{p2}/.../g/{p7?}` |
+| 8 | 8 | No | `/t8rN/a/{p1}/b/{p2}/.../h/{p8}` |
+| 9 | 9 | Yes | `/t9rN/a/{p1}/b/{p2}/.../i/{p9?}` |
+| 10 | 10 | No | `/t10rN/a/{p1}/b/{p2}/.../j/{p10}` |
+
+All parameters have `\d+` (numeric) constraints. Test URIs match with all parameters filled in.
 
 ## 10 Routes
 
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 20.98 µs | 2.84 ms | 5,631,828 | 0.00 KB |
-| FastRoute | 97.04 µs | 4.52 ms | 3,536,699 | 0.00 KB |
-| Symfony | 26.94 µs | 41.13 ms | 389,048 | 0.00 KB |
-| Laravel | 91.79 µs | 148.56 ms | 107,702 | 0.00 KB |
+| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |
+|--------|-------------|----------|-------------|--------|----------|
+| Signalforge | 33.86 µs | 3.18 ms | 3,148,404 | 0.00 KB | 100.0% |
+| FastRoute | 704.05 µs | 6.34 ms | 1,577,280 | 0.00 KB | 100.0% |
+| Symfony | 224.11 µs | 24.98 ms | 400,273 | 0.00 KB | 100.0% |
+| Laravel | 2.22 ms | 99.44 ms | 100,567 | 2.00 MB | 100.0% |
+
+## 50 Routes
+
+| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |
+|--------|-------------|----------|-------------|--------|----------|
+| Signalforge | 164.03 µs | 16.45 ms | 3,039,703 | 0.00 KB | 100.0% |
+| FastRoute | 442.03 µs | 36.24 ms | 1,379,805 | 0.00 KB | 100.0% |
+| Symfony | 121.12 µs | 241.42 ms | 207,105 | 0.00 KB | 100.0% |
+| Laravel | 288.96 µs | 607.92 ms | 82,247 | 0.00 KB | 100.0% |
 
 ## 100 Routes
 
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 107.05 µs | 8.56 ms | 6,190,078 | 0.00 KB |
-| FastRoute | 385.05 µs | 28.85 ms | 1,836,901 | 0.00 KB |
-| Symfony | 137.09 µs | 451.79 ms | 117,311 | 0.00 KB |
-| Laravel | 489.95 µs | 820.58 ms | 64,588 | 0.00 KB |
+| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |
+|--------|-------------|----------|-------------|--------|----------|
+| Signalforge | 226.02 µs | 15.39 ms | 3,248,225 | 0.00 KB | 100.0% |
+| FastRoute | 694.04 µs | 44.21 ms | 1,130,838 | 0.00 KB | 100.0% |
+| Symfony | 207.90 µs | 388.04 ms | 128,851 | 0.00 KB | 100.0% |
+| Laravel | 504.97 µs | 765.96 ms | 65,277 | 0.00 KB | 100.0% |
+
+## 500 Routes
+
+| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |
+|--------|-------------|----------|-------------|--------|----------|
+| Signalforge | 1.47 ms | 8.02 ms | 6,237,625 | 2.00 MB | 100.0% |
+| FastRoute | 3.38 ms | 98.04 ms | 509,995 | 2.00 MB | 100.0% |
+| Symfony | 997.07 µs | 1.55 s | 32,186 | 0.00 KB | 100.0% |
+| Laravel | 2.19 ms | 1.88 s | 26,570 | 0.00 KB | 100.0% |
 
 ## 1,000 Routes
 
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 919.82 µs | 9.32 ms | 5,687,264 | 2.00 MB |
-| FastRoute | 4.06 ms | 113.70 ms | 466,147 | 0.00 KB |
-| Symfony | 1.21 ms | 3.80 s | 13,951 | 0.00 KB |
-| Laravel | 3.65 ms | 4.04 s | 13,131 | 0.00 KB |
-
-## 10,000 Routes
-
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 9.07 ms | 9.47 ms | 5,597,192 | 10.00 MB |
-| FastRoute | 31.84 ms | 1.48 s | 35,741 | 10.00 MB |
-| Symfony | 13.40 ms | 35.93 s | 1,475 | 4.00 MB |
-| Laravel | 38.98 ms | 164.30 s | 322 | 6.00 MB |
-
-## 20,000 Routes
-
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 17.53 ms | 8.90 ms | 5,956,381 | 8.00 MB |
-| FastRoute | 110.38 ms | 3.92 s | 13,528 | 10.00 MB |
-
-## 100,000 Routes (Signalforge Only)
-
-| Router | Registration | Matching | Matches/sec | Memory |
-|--------|-------------|----------|-------------|--------|
-| Signalforge | 102.01 ms | 8.69 ms | 6,096,706 | 117.00 MB |
+| Router | Registration | Matching | Matches/sec | Memory | Hit Rate |
+|--------|-------------|----------|-------------|--------|----------|
+| Signalforge | 2.42 ms | 7.81 ms | 6,402,931 | 0.00 KB | 100.0% |
+| FastRoute | 6.29 ms | 174.45 ms | 286,620 | 2.00 MB | 100.0% |
+| Symfony | 2.14 ms | 2.95 s | 16,961 | 0.00 KB | 100.0% |
+| Laravel | 4.24 ms | 3.31 s | 15,101 | 0.00 KB | 100.0% |
 
 ## Summary
 
-- **1 routes**: Signalforge wins (Signalforge 61.3x faster than Laravel, uses 0.0% memory of FastRoute)
-- **10 routes**: Signalforge wins (Signalforge 52.3x faster than Laravel, uses 0.0% memory of FastRoute)
-- **100 routes**: Signalforge wins (Signalforge 95.8x faster than Laravel, uses 0.0% memory of FastRoute)
-- **1,000 routes**: Signalforge wins (Signalforge 433.1x faster than Laravel, uses 0.0% memory of FastRoute)
-- **10,000 routes**: Signalforge wins (Signalforge 17350.9x faster than Laravel, uses 100.0% memory of FastRoute)
-- **20,000 routes**: Signalforge wins (Signalforge 440.3x faster than FastRoute, uses 80.0% memory of FastRoute)
-- **100,000 routes**: Signalforge only (8.69 ms matching, 117.00 MB memory)
+- **10 routes**: Signalforge 31.3x faster than Laravel (3.18 ms vs 99.44 ms)
+- **50 routes**: Signalforge 37.0x faster than Laravel (16.45 ms vs 607.92 ms)
+- **100 routes**: Signalforge 49.8x faster than Laravel (15.39 ms vs 765.96 ms)
+- **500 routes**: Signalforge 234.8x faster than Laravel (8.02 ms vs 1.88 s)
+- **1,000 routes**: Signalforge 424.0x faster than Laravel (7.81 ms vs 3.31 s)
 
 ## Memory Usage Comparison
 
 | Routes | Signalforge | FastRoute | Symfony | Laravel | SF/FR Ratio |
 |--------|-------------|-----------|---------|---------|-------------|
-| 1 | 0.00 KB | 0.00 KB | 0.00 KB | 2.00 MB | N/A |
-| 10 | 0.00 KB | 0.00 KB | 0.00 KB | 0.00 KB | N/A |
+| 10 | 0.00 KB | 0.00 KB | 0.00 KB | 2.00 MB | N/A |
+| 50 | 0.00 KB | 0.00 KB | 0.00 KB | 0.00 KB | N/A |
 | 100 | 0.00 KB | 0.00 KB | 0.00 KB | 0.00 KB | N/A |
-| 1,000 | 2.00 MB | 0.00 KB | 0.00 KB | 0.00 KB | N/A |
-| 10,000 | 10.00 MB | 10.00 MB | 4.00 MB | 6.00 MB | 100.0% |
-| 20,000 | 8.00 MB | 10.00 MB | N/A | N/A |  80.0% |
-| 100,000 | 117.00 MB | N/A | N/A | N/A | N/A |
+| 500 | 2.00 MB | 2.00 MB | 0.00 KB | 0.00 KB | 100.0% |
+| 1,000 | 0.00 KB | 2.00 MB | 0.00 KB | 0.00 KB | N/A |
 
 ### Notes
 
-- All routers were tested with the same routes and URIs
-- Routes include parameter constraints (`{id}` with numeric validation)
-- Matching includes both static and parameterized routes
-- Memory shows router-specific memory usage (after registration)
-- Symfony and Laravel benchmarks skipped for >10,000 routes due to excessive time
-- FastRoute benchmarks skipped for >20,000 routes due to excessive time
-- 100,000 routes tested only with Signalforge (other routers too slow)
+- All routers tested with identical route patterns and matching URIs
+- Routes distributed evenly across 10 complexity tiers (1-10 path parameters)
+- Tiers 3, 5, 7, 9 include an optional trailing parameter
+- All parameters have numeric (`\d+`) constraints
+- Test URIs always include all parameters (including optional) for fair matching comparison
+- Memory shows router-specific memory delta after route registration
+- Hit Rate shows percentage of successful matches out of total attempts
