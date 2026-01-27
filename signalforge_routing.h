@@ -157,8 +157,6 @@ PHP_MINFO_FUNCTION(signalforge_routing);
  * ============================================================================ */
 
 ZEND_BEGIN_MODULE_GLOBALS(signalforge_routing)
-    sf_error_code last_error;
-    char *last_error_msg;
     sf_router *global_router;
 ZEND_END_MODULE_GLOBALS(signalforge_routing)
 
@@ -197,11 +195,11 @@ PHP_METHOD(Signalforge_Routing_Router, getRoutes);
 PHP_METHOD(Signalforge_Routing_Router, flush);
 PHP_METHOD(Signalforge_Routing_Router, cache);
 PHP_METHOD(Signalforge_Routing_Router, loadCache);
-PHP_METHOD(Signalforge_Routing_Router, setStrictSlashes);
 PHP_METHOD(Signalforge_Routing_Router, dump);
 PHP_METHOD(Signalforge_Routing_Router, getInstance);
 PHP_METHOD(Signalforge_Routing_Router, cli);
 PHP_METHOD(Signalforge_Routing_Router, routeUsing);
+PHP_METHOD(Signalforge_Routing_Router, resolver);
 PHP_METHOD(Signalforge_Routing_Router, dispatch);
 
 /* ============================================================================

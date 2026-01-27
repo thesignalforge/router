@@ -632,6 +632,8 @@ sf_router *sf_router_create(void)
     ALLOC_HASHTABLE(router->all_routes);
     zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
 
+    ZVAL_UNDEF(&router->dispatch_resolver);
+
 #ifdef ZTS
 #ifdef _WIN32
     InitializeSRWLock(&router->lock);
@@ -681,6 +683,10 @@ void sf_router_destroy(sf_router *router)
     }
     if (router->dispatch_domain) {
         zend_string_release(router->dispatch_domain);
+    }
+    if (!Z_ISUNDEF(router->dispatch_resolver)) {
+        zval_ptr_dtor(&router->dispatch_resolver);
+        ZVAL_UNDEF(&router->dispatch_resolver);
     }
 
     /* Destroy any remaining group context */
@@ -749,6 +755,10 @@ void sf_router_reset(sf_router *router)
     if (router->dispatch_domain) {
         zend_string_release(router->dispatch_domain);
         router->dispatch_domain = NULL;
+    }
+    if (!Z_ISUNDEF(router->dispatch_resolver)) {
+        zval_ptr_dtor(&router->dispatch_resolver);
+        ZVAL_UNDEF(&router->dispatch_resolver);
     }
 
     /* Destroy any remaining group context */
@@ -1756,6 +1766,20 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
         }
     }
 
+    /* Apply wheres (group constraints — don't overwrite route-specific ones).
+     * Group wheres are stored as {param_name => pattern_string} zval strings. */
+    if (group->wheres) {
+        zend_string *key;
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(group->wheres, key, val) {
+            if (key && Z_TYPE_P(val) == IS_STRING) {
+                /* Only add if route doesn't already define this constraint */
+                if (!route->wheres || !zend_hash_exists(route->wheres, key)) {
+                    sf_route_set_where(route, key, Z_STR_P(val));
+                }
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
 }
 
 /* ============================================================================
@@ -1766,9 +1790,9 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
  * Find terminal node through chain of optional children
  * Used when path is exhausted but we may have optional params with defaults
  */
-static sf_trie_node *sf_find_terminal_through_optionals(sf_trie_node *node)
+static sf_trie_node *sf_find_terminal_through_optionals(sf_trie_node *node, size_t depth)
 {
-    if (!node) {
+    if (!node || depth > SF_MAX_TRIE_DEPTH) {
         return NULL;
     }
 
@@ -1778,7 +1802,7 @@ static sf_trie_node *sf_find_terminal_through_optionals(sf_trie_node *node)
 
     /* Traverse through optional children to find terminal */
     if (node->optional_child) {
-        return sf_find_terminal_through_optionals(node->optional_child);
+        return sf_find_terminal_through_optionals(node->optional_child, depth + 1);
     }
 
     return NULL;
@@ -1815,7 +1839,7 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
             return node;
         }
         /* Check for terminal through chain of optional children */
-        sf_trie_node *terminal = sf_find_terminal_through_optionals(node->optional_child);
+        sf_trie_node *terminal = sf_find_terminal_through_optionals(node->optional_child, depth);
         if (terminal) {
             return terminal;
         }
@@ -2830,6 +2854,8 @@ static sf_trie_node *sf_deserialize_node_bin_internal(sf_read_buffer *buf, int d
             node->constraint = sf_constraint_create(node->param_name);
             if (node->constraint) {
                 sf_constraint_set_pattern(node->constraint, pattern);
+                /* Use cached validator type instead of re-detecting from pattern */
+                node->constraint->validator = (sf_validator_type)validator_type;
             }
             zend_string_release(pattern);
         } else if (pattern) {
@@ -3124,8 +3150,7 @@ sf_http_method sf_method_from_string(const char *method, size_t len)
         if (strncasecmp(method, "OPTIONS", 7) == 0) return SF_METHOD_OPTIONS;
     }
 
-    /* LOW-04 fix: Warn about unknown method instead of silent fallback */
-    php_error_docref(NULL, E_NOTICE,
+    php_error_docref(NULL, E_WARNING,
         "Signalforge\\Routing: Unknown HTTP method '%.*s', defaulting to GET",
         (int)(len > 20 ? 20 : len), method);
     return SF_METHOD_GET;
@@ -3179,8 +3204,7 @@ zend_string *sf_normalize_uri(const char *uri, size_t len, zend_bool strip_trail
     /* Strip trailing slash if requested (but keep root) */
     if (strip_trailing && normalized.s && ZSTR_LEN(normalized.s) > 1) {
         if (ZSTR_VAL(normalized.s)[ZSTR_LEN(normalized.s) - 1] == '/') {
-            ZSTR_LEN(normalized.s)--;
-            ZSTR_VAL(normalized.s)[ZSTR_LEN(normalized.s)] = '\0';
+            normalized.s = zend_string_truncate(normalized.s, ZSTR_LEN(normalized.s) - 1, 0);
         }
     }
 

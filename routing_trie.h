@@ -127,7 +127,6 @@ struct _sf_route {
     pcre2_code *domain_regex;       /* Compiled domain regex */
     zend_object *php_object;        /* Associated PHP Route object */
     uint32_t middleware_count;
-    uint32_t priority;              /* Route priority (lower = higher priority) */
     uint32_t refcount;              /* Reference count */
     sf_http_method method;          /* HTTP method (4 bytes) */
     uint8_t is_fallback;            /* Is this a fallback route */
@@ -233,13 +232,13 @@ struct _sf_router {
     sf_route_group *current_group;  /* Current group context */
     sf_route *fallback_route;       /* Fallback route */
     zend_bool is_immutable;         /* Locked during request */
-    zend_bool trailing_slash_strict;/* Strict trailing slash matching */
     uint32_t route_count;           /* Total route count */
 
     /* Dispatch context - set by routeUsing(), consumed by dispatch() */
     zend_string *dispatch_method;
     zend_string *dispatch_path;
     zend_string *dispatch_domain;   /* nullable */
+    zval dispatch_resolver;         /* Stored resolver callable (UNDEF if not set) */
 
 #ifdef ZTS
     /* Read-write lock for thread safety:
@@ -500,24 +499,5 @@ void sf_route_dump(sf_route *route);
 #define SF_PROXY_MAX_RESPONSE_BODY (64 * 1024 * 1024)  /* 64 MB */
 #define SF_PROXY_MIN_STATUS 100
 #define SF_PROXY_MAX_STATUS 599
-
-/* ============================================================================
- * Error Codes
- * ============================================================================ */
-
-typedef enum {
-    SF_OK                    = 0,
-    SF_ERR_INVALID_URI       = 1,
-    SF_ERR_DUPLICATE_ROUTE   = 2,
-    SF_ERR_INVALID_HANDLER   = 3,
-    SF_ERR_INVALID_CONSTRAINT= 4,
-    SF_ERR_ROUTE_NOT_FOUND   = 5,
-    SF_ERR_METHOD_NOT_ALLOWED= 6,
-    SF_ERR_IMMUTABLE         = 7,
-    SF_ERR_MEMORY            = 8,
-    SF_ERR_DEPTH_EXCEEDED    = 9
-} sf_error_code;
-
-/* Global error state - defined in signalforge_routing.h */
 
 #endif /* SIGNALFORGE_ROUTING_TRIE_H */

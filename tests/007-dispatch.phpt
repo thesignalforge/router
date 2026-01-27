@@ -125,7 +125,7 @@ string(2) "42"
 bool(true)
 bool(true)
 string(2) "99"
-No context: No routing context set. Call Router::routeUsing() before Router::dispatch()
+No context: No routing context set. Call Router::routeUsing() or Router::resolver() before Router::dispatch()
 Cleared: ok
 bool(true)
 string(4) "acme"
