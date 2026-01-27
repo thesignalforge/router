@@ -269,12 +269,6 @@ PHP_METHOD(Signalforge_Routing_Router, group)
     sf_router *router = sf_get_global_router();
     sf_route_group *group = sf_route_group_create();
 
-    if (!group) {
-        zend_throw_exception(sf_routing_exception_ce,
-            "Failed to create route group", 0);
-        RETURN_THROWS();
-    }
-
     /* Parse attributes */
     zval *val;
 
@@ -334,10 +328,13 @@ PHP_METHOD(Signalforge_Routing_Router, group)
     /* Call the callback */
     zval retval;
     fci.retval = &retval;
-    if (zend_call_function(&fci, &fcc) == FAILURE) {
+    if (zend_call_function(&fci, &fcc) == FAILURE || EG(exception)) {
         sf_router_end_group(router);
-        zend_throw_exception(sf_routing_exception_ce,
-            "Group callback execution failed", 0);
+        zval_ptr_dtor(&retval);
+        if (!EG(exception)) {
+            zend_throw_exception(sf_routing_exception_ce,
+                "Group callback execution failed", 0);
+        }
         RETURN_THROWS();
     }
 
@@ -345,8 +342,6 @@ PHP_METHOD(Signalforge_Routing_Router, group)
 
     /* Exit group context */
     sf_router_end_group(router);
-
-    RETURN_NULL();
 }
 
 PHP_METHOD(Signalforge_Routing_Router, prefix)
@@ -435,12 +430,6 @@ PHP_METHOD(Signalforge_Routing_Router, fallback)
     sf_router *router = sf_get_global_router();
 
     sf_route *route = sf_route_create();
-    if (!route) {
-        zend_throw_exception(sf_routing_exception_ce,
-            "Failed to create fallback route", 0);
-        RETURN_THROWS();
-    }
-
     route->uri = zend_string_init("*", 1, 0);
     route->is_fallback = 1;
     ZVAL_COPY(&route->handler, handler);
@@ -645,7 +634,7 @@ PHP_METHOD(Signalforge_Routing_Route, name)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     sf_route_set_name(intern->route, name);
@@ -670,7 +659,7 @@ PHP_METHOD(Signalforge_Routing_Route, middleware)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     if (Z_TYPE_P(middleware) == IS_ARRAY) {
@@ -696,7 +685,7 @@ PHP_METHOD(Signalforge_Routing_Route, where)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     if (Z_TYPE_P(param) == IS_ARRAY) {
@@ -731,7 +720,7 @@ static void sf_route_where_with_pattern(INTERNAL_FUNCTION_PARAMETERS,
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     zend_string *pattern = zend_string_init(pat, pat_len, 0);
@@ -796,7 +785,7 @@ PHP_METHOD(Signalforge_Routing_Route, whereIn)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     /* Build alternation pattern: (val1|val2|val3) */
@@ -845,7 +834,7 @@ PHP_METHOD(Signalforge_Routing_Route, defaults)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     sf_route_set_default(intern->route, param, value);
@@ -864,7 +853,7 @@ PHP_METHOD(Signalforge_Routing_Route, domain)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     sf_route_set_domain(intern->route, domain);
@@ -883,7 +872,7 @@ PHP_METHOD(Signalforge_Routing_Route, withoutMiddleware)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
-        RETURN_NULL();
+        RETURN_THROWS();
     }
 
     /* Remove specified middleware from the route's middleware list */

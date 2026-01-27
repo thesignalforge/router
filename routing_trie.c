@@ -588,10 +588,6 @@ sf_middleware_entry *sf_middleware_list_clone(sf_middleware_entry *head)
 
     while (current) {
         sf_middleware_entry *clone = sf_middleware_create(current->name);
-        if (!clone) {
-            sf_middleware_list_destroy(new_head);
-            return NULL;
-        }
 
         if (!Z_ISUNDEF(current->parameters)) {
             ZVAL_COPY(&clone->parameters, &current->parameters);
@@ -1136,10 +1132,6 @@ sf_route *sf_router_add_route(sf_router *router, sf_http_method method,
     }
 
     route = sf_route_create();
-    if (!route) {
-        return NULL;
-    }
-
     route->uri = zend_string_copy(uri);
     route->method = method;
     ZVAL_COPY(&route->handler, handler);
@@ -1260,9 +1252,6 @@ void sf_route_set_where(sf_route *route, zend_string *param, zend_string *patter
 
     /* Create constraint */
     sf_param_constraint *constraint = sf_constraint_create(param);
-    if (!constraint) {
-        return;
-    }
 
     if (!sf_constraint_set_pattern(constraint, pattern)) {
         sf_constraint_destroy(constraint);
@@ -1678,15 +1667,12 @@ static sf_trie_node *sf_trie_match_internal(sf_trie_node *node,
     }
 
     /* 4. Try wildcard (consumes all remaining path) - rare, used for catch-all routes */
-    if (UNEXPECTED(node->wildcard_child != NULL)) {
+    if (UNEXPECTED(node->wildcard_child != NULL) && node->wildcard_child->is_terminal) {
         /* Wildcard captures everything remaining including this segment */
         zval param_val;
         ZVAL_STRINGL(&param_val, seg_start, end - seg_start);
         zend_hash_update(params, node->wildcard_child->param_name, &param_val);
-
-        if (node->wildcard_child->is_terminal) {
-            return node->wildcard_child;
-        }
+        return node->wildcard_child;
     }
 
     return NULL;
@@ -1705,9 +1691,6 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
     }
 
     result = sf_match_result_create();
-    if (UNEXPECTED(!result)) {
-        return NULL;
-    }
 
     /* Get method-specific trie - invalid method is extremely rare */
     if (UNEXPECTED(method >= SF_METHOD_COUNT)) {
@@ -1821,7 +1804,7 @@ sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method met
 
                     if (ovector[2*n] != PCRE2_UNSET) {
                         zend_string *name = zend_string_init((char *)name_start,
-                            strlen((char *)name_start), 0);
+                            strnlen((char *)name_start, name_entry_size - 2), 0);
                         zval val;
                         ZVAL_STRINGL(&val, domain + ovector[2*n],
                             ovector[2*n+1] - ovector[2*n]);
@@ -2412,7 +2395,6 @@ static void sf_serialize_node_bin(sf_write_buffer *buf, sf_trie_node *node)
 static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
 {
     sf_route *route = sf_route_create();
-    if (!route) return NULL;
 
     /* URI */
     route->uri = sf_buf_read_string(buf);
@@ -2623,13 +2605,15 @@ static sf_trie_node *sf_deserialize_node_bin_internal(sf_read_buffer *buf, int d
                 /* Key failed but child succeeded - free the orphaned child */
                 sf_trie_node_destroy_recursive(child);
             }
-            if (key) zend_string_release(key);
 
-            /* HIGH-02 fix: If child deserialization failed, clean up and return */
-            if (!child && key) {
+            /* Check deserialization failure before releasing key */
+            if (!child) {
+                if (key) zend_string_release(key);
                 sf_trie_node_destroy_recursive(node);
                 return NULL;
             }
+
+            if (key) zend_string_release(key);
         }
     }
 
@@ -2763,10 +2747,7 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
     buf.pos = 16;
 
     /* Create router */
-    sf_router *router = emalloc(sizeof(sf_router));
-    if (!router) return NULL;
-
-    memset(router, 0, sizeof(sf_router));
+    sf_router *router = ecalloc(1, sizeof(sf_router));
 
     /* Initialize named routes hash table */
     ALLOC_HASHTABLE(router->named_routes);
