@@ -34,12 +34,16 @@ extern zend_class_entry *sf_route_ce;
 extern zend_class_entry *sf_match_result_ce;
 extern zend_class_entry *sf_routing_context_ce;
 extern zend_class_entry *sf_routing_exception_ce;
+extern zend_class_entry *sf_proxy_request_ce;
+extern zend_class_entry *sf_proxy_response_ce;
 
 /* Object handlers */
 extern zend_object_handlers sf_router_object_handlers;
 extern zend_object_handlers sf_route_object_handlers;
 extern zend_object_handlers sf_match_result_object_handlers;
 extern zend_object_handlers sf_routing_context_object_handlers;
+extern zend_object_handlers sf_proxy_request_object_handlers;
+extern zend_object_handlers sf_proxy_response_object_handlers;
 
 /* ============================================================================
  * PHP Object Structures
@@ -70,6 +74,18 @@ typedef struct _sf_routing_context_object {
     zend_object std;
 } sf_routing_context_object;
 
+/* ProxyRequest PHP object */
+typedef struct _sf_proxy_request_object {
+    sf_proxy_request *request;
+    zend_object std;
+} sf_proxy_request_object;
+
+/* ProxyResponse PHP object */
+typedef struct _sf_proxy_response_object {
+    sf_proxy_response *response;
+    zend_object std;
+} sf_proxy_response_object;
+
 /* ============================================================================
  * Object Accessor Macros
  * ============================================================================ */
@@ -94,6 +110,16 @@ static inline sf_routing_context_object *sf_routing_context_object_from_zend_obj
 }
 #define Z_ROUTING_CONTEXT_OBJ_P(zv) sf_routing_context_object_from_zend_object(Z_OBJ_P(zv))
 
+static inline sf_proxy_request_object *sf_proxy_request_object_from_zend_object(zend_object *obj) {
+    return (sf_proxy_request_object *)((char *)obj - XtOffsetOf(sf_proxy_request_object, std));
+}
+#define Z_PROXY_REQUEST_OBJ_P(zv) sf_proxy_request_object_from_zend_object(Z_OBJ_P(zv))
+
+static inline sf_proxy_response_object *sf_proxy_response_object_from_zend_object(zend_object *obj) {
+    return (sf_proxy_response_object *)((char *)obj - XtOffsetOf(sf_proxy_response_object, std));
+}
+#define Z_PROXY_RESPONSE_OBJ_P(zv) sf_proxy_response_object_from_zend_object(Z_OBJ_P(zv))
+
 /* ============================================================================
  * Object Create/Free Functions
  * ============================================================================ */
@@ -109,6 +135,12 @@ void sf_match_result_object_free(zend_object *obj);
 
 zend_object *sf_routing_context_object_create(zend_class_entry *ce);
 void sf_routing_context_object_free(zend_object *obj);
+
+zend_object *sf_proxy_request_object_create(zend_class_entry *ce);
+void sf_proxy_request_object_free(zend_object *obj);
+
+zend_object *sf_proxy_response_object_create(zend_class_entry *ce);
+void sf_proxy_response_object_free(zend_object *obj);
 
 /* ============================================================================
  * Module Lifecycle Functions
@@ -197,6 +229,10 @@ PHP_METHOD(Signalforge_Routing_Route, getMiddleware);
 PHP_METHOD(Signalforge_Routing_Route, getWheres);
 PHP_METHOD(Signalforge_Routing_Route, getDefaults);
 PHP_METHOD(Signalforge_Routing_Route, getDomain);
+PHP_METHOD(Signalforge_Routing_Route, proxy);
+PHP_METHOD(Signalforge_Routing_Route, onRequest);
+PHP_METHOD(Signalforge_Routing_Route, onResponse);
+PHP_METHOD(Signalforge_Routing_Route, getProxyUrl);
 
 /* ============================================================================
  * Method Declarations - MatchResult
@@ -211,6 +247,39 @@ PHP_METHOD(Signalforge_Routing_MatchResult, getMiddleware);
 PHP_METHOD(Signalforge_Routing_MatchResult, getRouteName);
 PHP_METHOD(Signalforge_Routing_MatchResult, getError);
 PHP_METHOD(Signalforge_Routing_MatchResult, param);
+PHP_METHOD(Signalforge_Routing_MatchResult, isProxy);
+PHP_METHOD(Signalforge_Routing_MatchResult, getProxyResponse);
+
+/* ============================================================================
+ * Method Declarations - ProxyRequest
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, __construct);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getMethod);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getUrl);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getHeaders);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getHeader);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getBody);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withMethod);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withUrl);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withHeader);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withBody);
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withoutHeader);
+
+/* ============================================================================
+ * Method Declarations - ProxyResponse
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, __construct);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getStatusCode);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getHeaders);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getHeader);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getBody);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withStatus);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withHeader);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withBody);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withoutHeader);
+PHP_METHOD(Signalforge_Routing_ProxyResponse, send);
 
 /* ============================================================================
  * Method Declarations - RoutingContext

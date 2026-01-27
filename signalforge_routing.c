@@ -14,6 +14,12 @@
 #include "routing_trie.h"
 #include "ext/spl/spl_exceptions.h"
 #include "zend_smart_str.h"
+#include "ext/standard/php_smart_string.h"
+#include "main/SAPI.h"
+#include "main/php_streams.h"
+#include "main/php_globals.h"
+#include <ctype.h>
+#include "ext/standard/url.h"
 
 /* Global variables */
 ZEND_DECLARE_MODULE_GLOBALS(signalforge_routing)
@@ -24,12 +30,16 @@ zend_class_entry *sf_route_ce = NULL;
 zend_class_entry *sf_match_result_ce = NULL;
 zend_class_entry *sf_routing_context_ce = NULL;
 zend_class_entry *sf_routing_exception_ce = NULL;
+zend_class_entry *sf_proxy_request_ce = NULL;
+zend_class_entry *sf_proxy_response_ce = NULL;
 
 /* Object handlers */
 zend_object_handlers sf_router_object_handlers;
 zend_object_handlers sf_route_object_handlers;
 zend_object_handlers sf_match_result_object_handlers;
 zend_object_handlers sf_routing_context_object_handlers;
+zend_object_handlers sf_proxy_request_object_handlers;
+zend_object_handlers sf_proxy_response_object_handlers;
 
 /* ============================================================================
  * Object Creation and Destruction
@@ -128,6 +138,54 @@ void sf_routing_context_object_free(zend_object *obj)
 
     if (intern->context) {
         sf_routing_context_destroy(intern->context);
+    }
+
+    zend_object_std_dtor(&intern->std);
+}
+
+zend_object *sf_proxy_request_object_create(zend_class_entry *ce)
+{
+    sf_proxy_request_object *intern = zend_object_alloc(sizeof(sf_proxy_request_object), ce);
+
+    zend_object_std_init(&intern->std, ce);
+    object_properties_init(&intern->std, ce);
+
+    intern->request = NULL;
+    intern->std.handlers = &sf_proxy_request_object_handlers;
+
+    return &intern->std;
+}
+
+void sf_proxy_request_object_free(zend_object *obj)
+{
+    sf_proxy_request_object *intern = sf_proxy_request_object_from_zend_object(obj);
+
+    if (intern->request) {
+        sf_proxy_request_destroy(intern->request);
+    }
+
+    zend_object_std_dtor(&intern->std);
+}
+
+zend_object *sf_proxy_response_object_create(zend_class_entry *ce)
+{
+    sf_proxy_response_object *intern = zend_object_alloc(sizeof(sf_proxy_response_object), ce);
+
+    zend_object_std_init(&intern->std, ce);
+    object_properties_init(&intern->std, ce);
+
+    intern->response = NULL;
+    intern->std.handlers = &sf_proxy_response_object_handlers;
+
+    return &intern->std;
+}
+
+void sf_proxy_response_object_free(zend_object *obj)
+{
+    sf_proxy_response_object *intern = sf_proxy_response_object_from_zend_object(obj);
+
+    if (intern->response) {
+        sf_proxy_response_destroy(intern->response);
     }
 
     zend_object_std_dtor(&intern->std);
@@ -719,6 +777,14 @@ PHP_METHOD(Signalforge_Routing_Router, routeUsing)
     RETURN_NULL();
 }
 
+/* Forward declarations for proxy helpers used in dispatch() */
+static void sf_proxy_send_response(sf_proxy_response *resp);
+static zend_string *sf_proxy_resolve_url(zend_string *url_pattern, HashTable *params);
+static sf_proxy_request *sf_proxy_build_request_from_sapi(zend_string *url, sf_http_method method);
+static sf_proxy_response *sf_proxy_execute(sf_proxy_request *req, sf_proxy_options *opts);
+static sf_proxy_request *sf_proxy_call_on_request(sf_proxy_options *opts, sf_proxy_request *req);
+static sf_proxy_response *sf_proxy_call_on_response(sf_proxy_options *opts, sf_proxy_response *resp);
+
 PHP_METHOD(Signalforge_Routing_Router, dispatch)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -749,6 +815,70 @@ PHP_METHOD(Signalforge_Routing_Router, dispatch)
             "Dispatch operation failed", 0);
         RETURN_THROWS();
     }
+
+    /* Execute proxy if route has proxy config */
+    if (result->matched && result->route && result->route->proxy) {
+        sf_proxy_options *proxy = result->route->proxy;
+
+        /* 1. Resolve URL — replace {param} placeholders from match params */
+        zend_string *resolved_url = sf_proxy_resolve_url(proxy->url, result->params);
+
+        /* 2. Validate resolved URL scheme — prevent SSRF via parameter injection */
+        const char *url_str = ZSTR_VAL(resolved_url);
+        if (ZSTR_LEN(resolved_url) < 8 ||
+            (strncasecmp(url_str, "http://", 7) != 0 &&
+             strncasecmp(url_str, "https://", 8) != 0)) {
+            zend_string_release(resolved_url);
+            zend_throw_exception(sf_routing_exception_ce,
+                "Resolved proxy URL must use http:// or https:// scheme", 0);
+            goto proxy_done;
+        }
+
+        /* 3. Build ProxyRequest from SAPI globals */
+        sf_proxy_request *req = sf_proxy_build_request_from_sapi(resolved_url, result->route->method);
+        zend_string_release(resolved_url);
+
+        /* 4. Call onRequest hook if set */
+        if (!Z_ISUNDEF(proxy->on_request)) {
+            sf_proxy_request *modified = sf_proxy_call_on_request(proxy, req);
+            if (modified) {
+                sf_proxy_request_destroy(req);
+                req = modified;
+            }
+            if (EG(exception)) {
+                sf_proxy_request_destroy(req);
+                goto proxy_done;
+            }
+        }
+
+        /* 5. Execute HTTP request via PHP streams */
+        sf_proxy_response *resp = sf_proxy_execute(req, proxy);
+        sf_proxy_request_destroy(req);
+
+        if (!resp) {
+            goto proxy_done;
+        }
+
+        /* 6. Call onResponse hook if set */
+        if (!Z_ISUNDEF(proxy->on_response)) {
+            sf_proxy_response *modified = sf_proxy_call_on_response(proxy, resp);
+            if (modified) {
+                sf_proxy_response_destroy(resp);
+                resp = modified;
+            }
+            if (EG(exception)) {
+                sf_proxy_response_destroy(resp);
+                goto proxy_done;
+            }
+        }
+
+        /* 7. Auto-send response to browser */
+        sf_proxy_send_response(resp);
+
+        /* 8. Store in match result for inspection */
+        result->proxy_response = resp;
+    }
+proxy_done:
 
     /* Return MatchResult object */
     object_init_ex(return_value, sf_match_result_ce);
@@ -1195,6 +1325,105 @@ PHP_METHOD(Signalforge_Routing_Route, getDomain)
     RETURN_STR_COPY(intern->route->domain);
 }
 
+PHP_METHOD(Signalforge_Routing_Route, proxy)
+{
+    zend_string *url;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(url)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
+    if (!intern->route) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
+        RETURN_THROWS();
+    }
+
+    /* Validate URL scheme — only http:// and https:// are allowed.
+     * URLs with {param} placeholders are also checked after substitution. */
+    const char *s = ZSTR_VAL(url);
+    if (ZSTR_LEN(url) < 8 ||
+        (strncasecmp(s, "http://", 7) != 0 && strncasecmp(s, "https://", 8) != 0)) {
+        /* Allow {param} at start — will be validated after substitution at dispatch time */
+        if (s[0] != '{') {
+            zend_throw_exception(sf_routing_exception_ce,
+                "Proxy URL must use http:// or https:// scheme", 0);
+            RETURN_THROWS();
+        }
+    }
+
+    if (intern->route->proxy) {
+        sf_proxy_options_destroy(intern->route->proxy);
+    }
+    intern->route->proxy = sf_proxy_options_create(url);
+
+    RETURN_ZVAL(ZEND_THIS, 1, 0);
+}
+
+PHP_METHOD(Signalforge_Routing_Route, onRequest)
+{
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_FUNC(fci, fcc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
+    if (!intern->route) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
+        RETURN_THROWS();
+    }
+    if (!intern->route->proxy) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Call proxy() before onRequest()", 0);
+        RETURN_THROWS();
+    }
+
+    zval_ptr_dtor(&intern->route->proxy->on_request);
+    ZVAL_COPY(&intern->route->proxy->on_request, &fci.function_name);
+
+    RETURN_ZVAL(ZEND_THIS, 1, 0);
+}
+
+PHP_METHOD(Signalforge_Routing_Route, onResponse)
+{
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_FUNC(fci, fcc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
+    if (!intern->route) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
+        RETURN_THROWS();
+    }
+    if (!intern->route->proxy) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Call proxy() before onResponse()", 0);
+        RETURN_THROWS();
+    }
+
+    zval_ptr_dtor(&intern->route->proxy->on_response);
+    ZVAL_COPY(&intern->route->proxy->on_response, &fci.function_name);
+
+    RETURN_ZVAL(ZEND_THIS, 1, 0);
+}
+
+PHP_METHOD(Signalforge_Routing_Route, getProxyUrl)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
+    if (!intern->route || !intern->route->proxy) {
+        RETURN_NULL();
+    }
+
+    RETURN_STR_COPY(intern->route->proxy->url);
+}
+
 /* ============================================================================
  * MatchResult Methods
  * ============================================================================ */
@@ -1331,6 +1560,943 @@ PHP_METHOD(Signalforge_Routing_MatchResult, param)
     }
 
     RETURN_NULL();
+}
+
+PHP_METHOD(Signalforge_Routing_MatchResult, isProxy)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_match_result_object *intern = Z_MATCH_RESULT_OBJ_P(ZEND_THIS);
+    if (!intern->result) {
+        RETURN_FALSE;
+    }
+
+    RETURN_BOOL(intern->result->proxy_response != NULL);
+}
+
+PHP_METHOD(Signalforge_Routing_MatchResult, getProxyResponse)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_match_result_object *intern = Z_MATCH_RESULT_OBJ_P(ZEND_THIS);
+    if (!intern->result || !intern->result->proxy_response) {
+        RETURN_NULL();
+    }
+
+    object_init_ex(return_value, sf_proxy_response_ce);
+    sf_proxy_response_object *resp_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
+    resp_obj->response = sf_proxy_response_clone(intern->result->proxy_response);
+}
+
+/* ============================================================================
+ * ProxyRequest Methods
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, __construct)
+{
+    /* Private constructor */
+    zend_throw_exception(sf_routing_exception_ce,
+        "ProxyRequest cannot be instantiated directly", 0);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getMethod)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request || !intern->request->method) {
+        RETURN_EMPTY_STRING();
+    }
+
+    RETURN_STR_COPY(intern->request->method);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getUrl)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request || !intern->request->url) {
+        RETURN_EMPTY_STRING();
+    }
+
+    RETURN_STR_COPY(intern->request->url);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getHeaders)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request || !intern->request->headers) {
+        array_init(return_value);
+        return;
+    }
+
+    array_init_size(return_value, zend_hash_num_elements(intern->request->headers));
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(intern->request->headers, key, val) {
+        if (key) {
+            zval copy;
+            ZVAL_COPY(&copy, val);
+            zend_hash_update(Z_ARRVAL_P(return_value), key, &copy);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getHeader)
+{
+    zend_string *name;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request || !intern->request->headers) {
+        RETURN_NULL();
+    }
+
+    zend_string *lower = zend_string_tolower(name);
+    zval *val = zend_hash_find(intern->request->headers, lower);
+    zend_string_release(lower);
+
+    if (val && Z_TYPE_P(val) == IS_STRING) {
+        RETURN_STR_COPY(Z_STR_P(val));
+    }
+
+    RETURN_NULL();
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, getBody)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request || !intern->request->body) {
+        RETURN_NULL();
+    }
+
+    RETURN_STR_COPY(intern->request->body);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withMethod)
+{
+    zend_string *method;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(method)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy request", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_request *new_req = sf_proxy_request_clone(intern->request);
+    zend_string_release(new_req->method);
+    new_req->method = zend_string_copy(method);
+
+    object_init_ex(return_value, sf_proxy_request_ce);
+    sf_proxy_request_object *new_obj = Z_PROXY_REQUEST_OBJ_P(return_value);
+    new_obj->request = new_req;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withUrl)
+{
+    zend_string *url;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(url)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy request", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_request *new_req = sf_proxy_request_clone(intern->request);
+    zend_string_release(new_req->url);
+    new_req->url = zend_string_copy(url);
+
+    object_init_ex(return_value, sf_proxy_request_ce);
+    sf_proxy_request_object *new_obj = Z_PROXY_REQUEST_OBJ_P(return_value);
+    new_obj->request = new_req;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withHeader)
+{
+    zend_string *name, *value;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(name)
+        Z_PARAM_STR(value)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy request", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_request *new_req = sf_proxy_request_clone(intern->request);
+
+    zend_string *lower = zend_string_tolower(name);
+    zval val;
+    ZVAL_STR_COPY(&val, value);
+    zend_hash_update(new_req->headers, lower, &val);
+    zend_string_release(lower);
+
+    object_init_ex(return_value, sf_proxy_request_ce);
+    sf_proxy_request_object *new_obj = Z_PROXY_REQUEST_OBJ_P(return_value);
+    new_obj->request = new_req;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withBody)
+{
+    zend_string *body;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(body)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy request", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_request *new_req = sf_proxy_request_clone(intern->request);
+    if (new_req->body) {
+        zend_string_release(new_req->body);
+    }
+    new_req->body = zend_string_copy(body);
+
+    object_init_ex(return_value, sf_proxy_request_ce);
+    sf_proxy_request_object *new_obj = Z_PROXY_REQUEST_OBJ_P(return_value);
+    new_obj->request = new_req;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyRequest, withoutHeader)
+{
+    zend_string *name;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_request_object *intern = Z_PROXY_REQUEST_OBJ_P(ZEND_THIS);
+    if (!intern->request) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy request", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_request *new_req = sf_proxy_request_clone(intern->request);
+
+    zend_string *lower = zend_string_tolower(name);
+    zend_hash_del(new_req->headers, lower);
+    zend_string_release(lower);
+
+    object_init_ex(return_value, sf_proxy_request_ce);
+    sf_proxy_request_object *new_obj = Z_PROXY_REQUEST_OBJ_P(return_value);
+    new_obj->request = new_req;
+}
+
+/* ============================================================================
+ * ProxyResponse Methods
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, __construct)
+{
+    /* Private constructor */
+    zend_throw_exception(sf_routing_exception_ce,
+        "ProxyResponse cannot be instantiated directly", 0);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getStatusCode)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        RETURN_LONG(0);
+    }
+
+    RETURN_LONG(intern->response->status_code);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getHeaders)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response || !intern->response->headers) {
+        array_init(return_value);
+        return;
+    }
+
+    array_init_size(return_value, zend_hash_num_elements(intern->response->headers));
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(intern->response->headers, key, val) {
+        if (key) {
+            zval copy;
+            ZVAL_COPY(&copy, val);
+            zend_hash_update(Z_ARRVAL_P(return_value), key, &copy);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getHeader)
+{
+    zend_string *name;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response || !intern->response->headers) {
+        RETURN_NULL();
+    }
+
+    zend_string *lower = zend_string_tolower(name);
+    zval *val = zend_hash_find(intern->response->headers, lower);
+    zend_string_release(lower);
+
+    if (val && Z_TYPE_P(val) == IS_STRING) {
+        RETURN_STR_COPY(Z_STR_P(val));
+    }
+
+    RETURN_NULL();
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, getBody)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response || !intern->response->body) {
+        RETURN_EMPTY_STRING();
+    }
+
+    RETURN_STR_COPY(intern->response->body);
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withStatus)
+{
+    zend_long code;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(code)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy response", 0);
+        RETURN_THROWS();
+    }
+
+    if (code < SF_PROXY_MIN_STATUS || code > SF_PROXY_MAX_STATUS) {
+        zend_throw_exception_ex(sf_routing_exception_ce, 0,
+            "HTTP status code must be between %d and %d, got " ZEND_LONG_FMT,
+            SF_PROXY_MIN_STATUS, SF_PROXY_MAX_STATUS, code);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_response *new_resp = sf_proxy_response_clone(intern->response);
+    new_resp->status_code = (uint16_t)code;
+
+    object_init_ex(return_value, sf_proxy_response_ce);
+    sf_proxy_response_object *new_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
+    new_obj->response = new_resp;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withHeader)
+{
+    zend_string *name, *value;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STR(name)
+        Z_PARAM_STR(value)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy response", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_response *new_resp = sf_proxy_response_clone(intern->response);
+
+    zend_string *lower = zend_string_tolower(name);
+    zval val;
+    ZVAL_STR_COPY(&val, value);
+    zend_hash_update(new_resp->headers, lower, &val);
+    zend_string_release(lower);
+
+    object_init_ex(return_value, sf_proxy_response_ce);
+    sf_proxy_response_object *new_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
+    new_obj->response = new_resp;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withBody)
+{
+    zend_string *body;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(body)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy response", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_response *new_resp = sf_proxy_response_clone(intern->response);
+    if (new_resp->body) {
+        zend_string_release(new_resp->body);
+    }
+    new_resp->body = zend_string_copy(body);
+
+    object_init_ex(return_value, sf_proxy_response_ce);
+    sf_proxy_response_object *new_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
+    new_obj->response = new_resp;
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, withoutHeader)
+{
+    zend_string *name;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy response", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_response *new_resp = sf_proxy_response_clone(intern->response);
+
+    zend_string *lower = zend_string_tolower(name);
+    zend_hash_del(new_resp->headers, lower);
+    zend_string_release(lower);
+
+    object_init_ex(return_value, sf_proxy_response_ce);
+    sf_proxy_response_object *new_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
+    new_obj->response = new_resp;
+}
+
+static void sf_proxy_send_response(sf_proxy_response *resp)
+{
+    if (!resp) {
+        return;
+    }
+
+    SG(sapi_headers).http_response_code = resp->status_code;
+
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(resp->headers, key, val) {
+        if (key && Z_TYPE_P(val) == IS_STRING) {
+            sapi_header_line ctr = {0};
+            smart_str header_str = {0};
+            smart_str_append(&header_str, key);
+            smart_str_appends(&header_str, ": ");
+            smart_str_append(&header_str, Z_STR_P(val));
+            smart_str_0(&header_str);
+
+            ctr.line = ZSTR_VAL(header_str.s);
+            ctr.line_len = ZSTR_LEN(header_str.s);
+            sapi_header_op(SAPI_HEADER_REPLACE, &ctr);
+            smart_str_free(&header_str);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    if (resp->body && ZSTR_LEN(resp->body) > 0) {
+        php_write(ZSTR_VAL(resp->body), ZSTR_LEN(resp->body));
+    }
+}
+
+PHP_METHOD(Signalforge_Routing_ProxyResponse, send)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_proxy_response_object *intern = Z_PROXY_RESPONSE_OBJ_P(ZEND_THIS);
+    if (!intern->response) {
+        zend_throw_exception(sf_routing_exception_ce, "Invalid proxy response", 0);
+        RETURN_THROWS();
+    }
+
+    sf_proxy_send_response(intern->response);
+}
+
+/* ============================================================================
+ * Proxy Execution Helpers
+ * ============================================================================ */
+
+static zend_string *sf_proxy_resolve_url(zend_string *url_pattern, HashTable *params)
+{
+    if (!params || zend_hash_num_elements(params) == 0) {
+        return zend_string_copy(url_pattern);
+    }
+
+    smart_str result = {0};
+    const char *p = ZSTR_VAL(url_pattern);
+    const char *end = p + ZSTR_LEN(url_pattern);
+
+    while (p < end) {
+        if (*p == '{') {
+            const char *close = memchr(p + 1, '}', end - p - 1);
+            if (close) {
+                zend_string *param_name = zend_string_init(p + 1, close - p - 1, 0);
+                zval *val = zend_hash_find(params, param_name);
+                zend_string_release(param_name);
+
+                if (val && Z_TYPE_P(val) == IS_STRING) {
+                    /* URL-encode the parameter value to prevent query/fragment injection */
+                    zend_string *encoded = php_raw_url_encode(
+                        ZSTR_VAL(Z_STR_P(val)), ZSTR_LEN(Z_STR_P(val)));
+                    smart_str_append(&result, encoded);
+                    zend_string_release(encoded);
+                } else {
+                    /* Unresolved placeholder — keep literal */
+                    smart_str_appendl(&result, p, close - p + 1);
+                }
+                p = close + 1;
+                continue;
+            }
+        }
+        smart_str_appendc(&result, *p);
+        p++;
+    }
+
+    if (result.s) {
+        smart_str_0(&result);
+        return result.s; /* caller takes ownership */
+    }
+    return zend_string_copy(url_pattern);
+}
+
+static zend_string *sf_server_key_to_header(zend_string *key)
+{
+    /* Strip HTTP_ prefix, replace _ with -, lowercase */
+    const char *src = ZSTR_VAL(key) + SF_HTTP_PREFIX_LEN;
+    size_t len = ZSTR_LEN(key) - SF_HTTP_PREFIX_LEN;
+
+    zend_string *header = zend_string_alloc(len, 0);
+    char *dst = ZSTR_VAL(header);
+
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == '_') {
+            dst[i] = '-';
+        } else {
+            dst[i] = (char)tolower((unsigned char)src[i]);
+        }
+    }
+    dst[len] = '\0';
+
+    return header;
+}
+
+/* Check if a header value contains \r or \n (HTTP header injection) */
+static zend_bool sf_header_value_is_safe(const char *val, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (val[i] == '\r' || val[i] == '\n') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Headers that must not be forwarded to the upstream */
+static zend_bool sf_is_sensitive_header(const char *name, size_t len)
+{
+    /* Hop-by-hop and security-sensitive headers */
+    static const struct { const char *name; size_t len; } blocked[] = {
+        { "cookie",            6 },
+        { "authorization",    13 },
+        { "proxy-authorization", 19 },
+        { "connection",       10 },
+        { "keep-alive",        10 },
+        { "transfer-encoding", 17 },
+        { "te",                2 },
+        { "upgrade",           7 },
+    };
+
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        if (len == blocked[i].len && memcmp(name, blocked[i].name, len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Extract host from URL: "https://api.example.com:8080/path" -> "api.example.com:8080" */
+static zend_string *sf_extract_host_from_url(zend_string *url)
+{
+    const char *s = ZSTR_VAL(url);
+    const char *host_start = strstr(s, "://");
+    if (!host_start) {
+        return NULL;
+    }
+    host_start += 3; /* skip "://" */
+
+    const char *host_end = strchr(host_start, '/');
+    size_t host_len = host_end ? (size_t)(host_end - host_start) : strlen(host_start);
+    if (host_len == 0) {
+        return NULL;
+    }
+
+    return zend_string_init(host_start, host_len, 0);
+}
+
+static sf_proxy_request *sf_proxy_build_request_from_sapi(zend_string *url, sf_http_method method)
+{
+    const char *method_name = sf_method_to_string(method);
+    zend_string *method_str = zend_string_init(method_name, strlen(method_name), 0);
+
+    HashTable *headers;
+    ALLOC_HASHTABLE(headers);
+    zend_hash_init(headers, SF_HEADERS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
+
+    zend_string *original_host = NULL;
+    zend_string *original_proto = NULL;
+
+    zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
+    if (server && Z_TYPE_P(server) == IS_ARRAY) {
+        zend_string *key;
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(server), key, val) {
+            if (key && Z_TYPE_P(val) == IS_STRING &&
+                ZSTR_LEN(key) > SF_HTTP_PREFIX_LEN &&
+                memcmp(ZSTR_VAL(key), SF_HTTP_PREFIX, SF_HTTP_PREFIX_LEN) == 0) {
+
+                zend_string *header_name = sf_server_key_to_header(key);
+
+                /* Capture original host before filtering */
+                if (ZSTR_LEN(header_name) == 4 &&
+                    memcmp(ZSTR_VAL(header_name), "host", 4) == 0) {
+                    original_host = zend_string_copy(Z_STR_P(val));
+                    zend_string_release(header_name);
+                    continue; /* Don't forward original Host */
+                }
+
+                /* Strip sensitive and hop-by-hop headers */
+                if (sf_is_sensitive_header(ZSTR_VAL(header_name), ZSTR_LEN(header_name))) {
+                    zend_string_release(header_name);
+                    continue;
+                }
+
+                /* Reject values containing \r or \n (header injection) */
+                if (!sf_header_value_is_safe(Z_STRVAL_P(val), Z_STRLEN_P(val))) {
+                    zend_string_release(header_name);
+                    continue;
+                }
+
+                zval header_val;
+                ZVAL_STR_COPY(&header_val, Z_STR_P(val));
+                zend_hash_update(headers, header_name, &header_val);
+                zend_string_release(header_name);
+            }
+        } ZEND_HASH_FOREACH_END();
+
+        zval *ct = zend_hash_str_find(Z_ARRVAL_P(server), "CONTENT_TYPE", sizeof("CONTENT_TYPE") - 1);
+        if (ct && Z_TYPE_P(ct) == IS_STRING &&
+            sf_header_value_is_safe(Z_STRVAL_P(ct), Z_STRLEN_P(ct))) {
+            zval v;
+            ZVAL_STR_COPY(&v, Z_STR_P(ct));
+            zend_hash_str_update(headers, "content-type", sizeof("content-type") - 1, &v);
+        }
+        zval *cl = zend_hash_str_find(Z_ARRVAL_P(server), "CONTENT_LENGTH", sizeof("CONTENT_LENGTH") - 1);
+        if (cl && Z_TYPE_P(cl) == IS_STRING &&
+            sf_header_value_is_safe(Z_STRVAL_P(cl), Z_STRLEN_P(cl))) {
+            zval v;
+            ZVAL_STR_COPY(&v, Z_STR_P(cl));
+            zend_hash_str_update(headers, "content-length", sizeof("content-length") - 1, &v);
+        }
+
+        /* Detect original protocol */
+        zval *https = zend_hash_str_find(Z_ARRVAL_P(server), "HTTPS", sizeof("HTTPS") - 1);
+        if (https && Z_TYPE_P(https) == IS_STRING &&
+            !(ZSTR_LEN(Z_STR_P(https)) == 3 && memcmp(ZSTR_VAL(Z_STR_P(https)), "off", 3) == 0)) {
+            original_proto = zend_string_init("https", sizeof("https") - 1, 0);
+        } else {
+            original_proto = zend_string_init("http", sizeof("http") - 1, 0);
+        }
+    }
+
+    /* Set Host header to match upstream URL */
+    zend_string *upstream_host = sf_extract_host_from_url(url);
+    if (upstream_host) {
+        zval host_val;
+        ZVAL_STR(&host_val, upstream_host); /* transfers ownership */
+        zend_hash_str_update(headers, "host", sizeof("host") - 1, &host_val);
+    }
+
+    /* Add X-Forwarded-* headers */
+    if (original_host) {
+        zval v;
+        ZVAL_STR(&v, original_host); /* transfers ownership */
+        zend_hash_str_update(headers, "x-forwarded-host", sizeof("x-forwarded-host") - 1, &v);
+    }
+    if (original_proto) {
+        zval v;
+        ZVAL_STR(&v, original_proto); /* transfers ownership */
+        zend_hash_str_update(headers, "x-forwarded-proto", sizeof("x-forwarded-proto") - 1, &v);
+    }
+
+    /* Add X-Forwarded-For from REMOTE_ADDR */
+    if (server && Z_TYPE_P(server) == IS_ARRAY) {
+        zval *remote = zend_hash_str_find(Z_ARRVAL_P(server), "REMOTE_ADDR", sizeof("REMOTE_ADDR") - 1);
+        if (remote && Z_TYPE_P(remote) == IS_STRING &&
+            sf_header_value_is_safe(Z_STRVAL_P(remote), Z_STRLEN_P(remote))) {
+            zval v;
+            ZVAL_STR_COPY(&v, Z_STR_P(remote));
+            zend_hash_str_update(headers, "x-forwarded-for", sizeof("x-forwarded-for") - 1, &v);
+        }
+    }
+
+    zend_string *body = NULL;
+    php_stream *input = php_stream_open_wrapper("php://input", "rb", 0, NULL);
+    if (input) {
+        body = php_stream_copy_to_mem(input, PHP_STREAM_COPY_ALL, 0);
+        php_stream_close(input);
+    }
+
+    sf_proxy_request *req = sf_proxy_request_create(method_str, url, headers, body);
+
+    zend_string_release(method_str);
+    zend_hash_destroy(headers);
+    FREE_HASHTABLE(headers);
+    if (body) {
+        zend_string_release(body);
+    }
+
+    return req;
+}
+
+static sf_proxy_response *sf_proxy_execute(sf_proxy_request *req, sf_proxy_options *opts)
+{
+    zval http_opts;
+    array_init(&http_opts);
+
+    add_assoc_str(&http_opts, "method", zend_string_copy(req->method));
+
+    /* Build headers string, stripping values containing \r\n to prevent injection */
+    smart_str header_str = {0};
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(req->headers, key, val) {
+        if (key && Z_TYPE_P(val) == IS_STRING &&
+            sf_header_value_is_safe(Z_STRVAL_P(val), Z_STRLEN_P(val))) {
+            smart_str_append(&header_str, key);
+            smart_str_appends(&header_str, ": ");
+            smart_str_append(&header_str, Z_STR_P(val));
+            smart_str_appends(&header_str, "\r\n");
+        }
+    } ZEND_HASH_FOREACH_END();
+    if (header_str.s) {
+        smart_str_0(&header_str);
+        add_assoc_str(&http_opts, "header", header_str.s);
+        header_str.s = NULL; /* ownership transferred to array */
+    }
+
+    if (req->body && ZSTR_LEN(req->body) > 0) {
+        add_assoc_str(&http_opts, "content", zend_string_copy(req->body));
+    }
+
+    add_assoc_double(&http_opts, "timeout", opts->timeout);
+    add_assoc_bool(&http_opts, "ignore_errors", 1);
+
+    zval ssl_opts;
+    array_init(&ssl_opts);
+    add_assoc_bool(&ssl_opts, "verify_peer", opts->verify_ssl);
+    add_assoc_bool(&ssl_opts, "verify_peer_name", opts->verify_ssl);
+
+    php_stream_context *ctx = php_stream_context_alloc();
+    php_stream_context_set_option(ctx, "http", NULL, &http_opts);
+    php_stream_context_set_option(ctx, "ssl", NULL, &ssl_opts);
+
+    zval_ptr_dtor(&http_opts);
+    zval_ptr_dtor(&ssl_opts);
+
+    php_stream *stream = php_stream_open_wrapper_ex(
+        ZSTR_VAL(req->url), "rb",
+        REPORT_ERRORS,
+        NULL, ctx);
+
+    if (!stream) {
+        return NULL;
+    }
+
+    /* Read response body with size limit to prevent memory exhaustion */
+    zend_string *resp_body = php_stream_copy_to_mem(stream, SF_PROXY_MAX_RESPONSE_BODY, 0);
+
+    uint16_t status_code = 200;
+    HashTable *resp_headers;
+    ALLOC_HASHTABLE(resp_headers);
+    zend_hash_init(resp_headers, SF_HEADERS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
+
+    if (Z_TYPE(stream->wrapperdata) == IS_ARRAY) {
+        zval *line;
+        zend_bool first = 1;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL(stream->wrapperdata), line) {
+            if (Z_TYPE_P(line) != IS_STRING) continue;
+            if (first) {
+                /* Parse "HTTP/1.1 200 OK" */
+                const char *s = Z_STRVAL_P(line);
+                const char *space = strchr(s, ' ');
+                if (space) {
+                    char *endptr;
+                    long parsed = strtol(space + 1, &endptr, 10);
+                    if (endptr != space + 1 &&
+                        parsed >= SF_PROXY_MIN_STATUS && parsed <= SF_PROXY_MAX_STATUS) {
+                        status_code = (uint16_t)parsed;
+                    }
+                }
+                first = 0;
+            } else {
+                /* Parse "Header-Name: value" */
+                const char *line_str = Z_STRVAL_P(line);
+                size_t line_len = Z_STRLEN_P(line);
+                const char *colon = memchr(line_str, ':', line_len);
+                if (colon && colon > line_str) {
+                    size_t name_len = (size_t)(colon - line_str);
+                    const char *value_start = colon + 1;
+                    const char *line_end = line_str + line_len;
+
+                    /* Skip leading spaces with bounds check */
+                    while (value_start < line_end && *value_start == ' ') {
+                        value_start++;
+                    }
+                    size_t value_len = (size_t)(line_end - value_start);
+
+                    zend_string *header_name = zend_string_init(line_str, name_len, 0);
+                    zend_str_tolower(ZSTR_VAL(header_name), ZSTR_LEN(header_name));
+
+                    zval header_val;
+                    ZVAL_STRINGL(&header_val, value_start, value_len);
+                    zend_hash_update(resp_headers, header_name, &header_val);
+                    zend_string_release(header_name);
+                }
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    php_stream_close(stream);
+
+    sf_proxy_response *resp = sf_proxy_response_create(
+        status_code, resp_headers, resp_body ? resp_body : ZSTR_EMPTY_ALLOC());
+
+    zend_hash_destroy(resp_headers);
+    FREE_HASHTABLE(resp_headers);
+    if (resp_body) {
+        zend_string_release(resp_body);
+    }
+
+    return resp;
+}
+
+static sf_proxy_request *sf_proxy_call_on_request(sf_proxy_options *opts, sf_proxy_request *req)
+{
+    zval request_zv;
+    object_init_ex(&request_zv, sf_proxy_request_ce);
+    sf_proxy_request_object *req_obj = Z_PROXY_REQUEST_OBJ_P(&request_zv);
+    req_obj->request = sf_proxy_request_clone(req);
+
+    zval retval;
+    ZVAL_UNDEF(&retval);
+    zval args[1];
+    ZVAL_COPY_VALUE(&args[0], &request_zv);
+
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+    char *error = NULL;
+    if (zend_fcall_info_init(&opts->on_request, 0, &fci, &fcc, NULL, &error) != SUCCESS) {
+        zval_ptr_dtor(&request_zv);
+        if (error) efree(error);
+        return NULL;
+    }
+    if (error) efree(error);
+
+    fci.retval = &retval;
+    fci.param_count = 1;
+    fci.params = args;
+
+    if (zend_call_function(&fci, &fcc) != SUCCESS || EG(exception)) {
+        zval_ptr_dtor(&request_zv);
+        if (!Z_ISUNDEF(retval)) zval_ptr_dtor(&retval);
+        return NULL;
+    }
+
+    sf_proxy_request *result = NULL;
+    if (Z_TYPE(retval) == IS_OBJECT && instanceof_function(Z_OBJCE(retval), sf_proxy_request_ce)) {
+        sf_proxy_request_object *ret_obj = sf_proxy_request_object_from_zend_object(Z_OBJ(retval));
+        result = sf_proxy_request_clone(ret_obj->request);
+    } else if (!EG(exception)) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "onRequest callback must return a ProxyRequest instance", 0);
+    }
+
+    zval_ptr_dtor(&request_zv);
+    zval_ptr_dtor(&retval);
+
+    return result;
+}
+
+static sf_proxy_response *sf_proxy_call_on_response(sf_proxy_options *opts, sf_proxy_response *resp)
+{
+    zval response_zv;
+    object_init_ex(&response_zv, sf_proxy_response_ce);
+    sf_proxy_response_object *resp_obj = Z_PROXY_RESPONSE_OBJ_P(&response_zv);
+    resp_obj->response = sf_proxy_response_clone(resp);
+
+    zval retval;
+    ZVAL_UNDEF(&retval);
+    zval args[1];
+    ZVAL_COPY_VALUE(&args[0], &response_zv);
+
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+    char *error = NULL;
+    if (zend_fcall_info_init(&opts->on_response, 0, &fci, &fcc, NULL, &error) != SUCCESS) {
+        zval_ptr_dtor(&response_zv);
+        if (error) efree(error);
+        return NULL;
+    }
+    if (error) efree(error);
+
+    fci.retval = &retval;
+    fci.param_count = 1;
+    fci.params = args;
+
+    if (zend_call_function(&fci, &fcc) != SUCCESS || EG(exception)) {
+        zval_ptr_dtor(&response_zv);
+        if (!Z_ISUNDEF(retval)) zval_ptr_dtor(&retval);
+        return NULL;
+    }
+
+    sf_proxy_response *result = NULL;
+    if (Z_TYPE(retval) == IS_OBJECT && instanceof_function(Z_OBJCE(retval), sf_proxy_response_ce)) {
+        sf_proxy_response_object *ret_obj = sf_proxy_response_object_from_zend_object(Z_OBJ(retval));
+        result = sf_proxy_response_clone(ret_obj->response);
+    } else if (!EG(exception)) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "onResponse callback must return a ProxyResponse instance", 0);
+    }
+
+    zval_ptr_dtor(&response_zv);
+    zval_ptr_dtor(&retval);
+
+    return result;
 }
 
 /* ============================================================================
@@ -1563,6 +2729,21 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_route_getDomain, 0, 0, IS_STRING, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_route_proxy, 0, 1, Signalforge\\Routing\\Route, 0)
+    ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_route_onRequest, 0, 1, Signalforge\\Routing\\Route, 0)
+    ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_route_onResponse, 0, 1, Signalforge\\Routing\\Route, 0)
+    ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_route_getProxyUrl, 0, 0, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
 /* MatchResult arg info */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_match_construct, 0, 0, 0)
 ZEND_END_ARG_INFO()
@@ -1591,6 +2772,90 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_match_param, 0, 1, IS_MIXED, 0)
     ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, default, IS_MIXED, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_match_isProxy, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_match_getProxyResponse, 0, 0, Signalforge\\Routing\\ProxyResponse, 1)
+ZEND_END_ARG_INFO()
+
+/* ProxyRequest arg info */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_proxy_request_construct, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_request_getMethod, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_request_getUrl, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_request_getHeaders, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_request_getHeader, 0, 1, IS_STRING, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_request_getBody, 0, 0, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_request_withMethod, 0, 1, Signalforge\\Routing\\ProxyRequest, 0)
+    ZEND_ARG_TYPE_INFO(0, method, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_request_withUrl, 0, 1, Signalforge\\Routing\\ProxyRequest, 0)
+    ZEND_ARG_TYPE_INFO(0, url, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_request_withHeader, 0, 2, Signalforge\\Routing\\ProxyRequest, 0)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, value, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_request_withBody, 0, 1, Signalforge\\Routing\\ProxyRequest, 0)
+    ZEND_ARG_TYPE_INFO(0, body, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_request_withoutHeader, 0, 1, Signalforge\\Routing\\ProxyRequest, 0)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+/* ProxyResponse arg info */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_proxy_response_construct, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_response_getStatusCode, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_response_getHeaders, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_response_getHeader, 0, 1, IS_STRING, 1)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_response_getBody, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_response_withStatus, 0, 1, Signalforge\\Routing\\ProxyResponse, 0)
+    ZEND_ARG_TYPE_INFO(0, code, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_response_withHeader, 0, 2, Signalforge\\Routing\\ProxyResponse, 0)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, value, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_response_withBody, 0, 1, Signalforge\\Routing\\ProxyResponse, 0)
+    ZEND_ARG_TYPE_INFO(0, body, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_proxy_response_withoutHeader, 0, 1, Signalforge\\Routing\\ProxyResponse, 0)
+    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_proxy_response_send, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
 /* ============================================================================
@@ -1651,6 +2916,10 @@ static const zend_function_entry sf_route_methods[] = {
     PHP_ME(Signalforge_Routing_Route, getWheres, arginfo_route_getWheres, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_Route, getDefaults, arginfo_route_getDefaults, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_Route, getDomain, arginfo_route_getDomain, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Route, proxy, arginfo_route_proxy, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Route, onRequest, arginfo_route_onRequest, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Route, onResponse, arginfo_route_onResponse, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Route, getProxyUrl, arginfo_route_getProxyUrl, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -1664,6 +2933,37 @@ static const zend_function_entry sf_match_result_methods[] = {
     PHP_ME(Signalforge_Routing_MatchResult, getRouteName, arginfo_match_getRouteName, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, getError, arginfo_match_getError, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, param, arginfo_match_param, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_MatchResult, isProxy, arginfo_match_isProxy, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_MatchResult, getProxyResponse, arginfo_match_getProxyResponse, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry sf_proxy_request_methods[] = {
+    PHP_ME(Signalforge_Routing_ProxyRequest, __construct, arginfo_proxy_request_construct, ZEND_ACC_PRIVATE)
+    PHP_ME(Signalforge_Routing_ProxyRequest, getMethod, arginfo_proxy_request_getMethod, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, getUrl, arginfo_proxy_request_getUrl, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, getHeaders, arginfo_proxy_request_getHeaders, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, getHeader, arginfo_proxy_request_getHeader, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, getBody, arginfo_proxy_request_getBody, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, withMethod, arginfo_proxy_request_withMethod, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, withUrl, arginfo_proxy_request_withUrl, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, withHeader, arginfo_proxy_request_withHeader, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, withBody, arginfo_proxy_request_withBody, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyRequest, withoutHeader, arginfo_proxy_request_withoutHeader, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry sf_proxy_response_methods[] = {
+    PHP_ME(Signalforge_Routing_ProxyResponse, __construct, arginfo_proxy_response_construct, ZEND_ACC_PRIVATE)
+    PHP_ME(Signalforge_Routing_ProxyResponse, getStatusCode, arginfo_proxy_response_getStatusCode, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, getHeaders, arginfo_proxy_response_getHeaders, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, getHeader, arginfo_proxy_response_getHeader, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, getBody, arginfo_proxy_response_getBody, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, withStatus, arginfo_proxy_response_withStatus, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, withHeader, arginfo_proxy_response_withHeader, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, withBody, arginfo_proxy_response_withBody, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, withoutHeader, arginfo_proxy_response_withoutHeader, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_ProxyResponse, send, arginfo_proxy_response_send, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -1740,6 +3040,28 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_routing_context_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_routing_context_object_handlers.offset = XtOffsetOf(sf_routing_context_object, std);
     sf_routing_context_object_handlers.free_obj = sf_routing_context_object_free;
+
+    /* Register ProxyRequest class */
+    INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "ProxyRequest", sf_proxy_request_methods);
+    sf_proxy_request_ce = zend_register_internal_class(&ce);
+    sf_proxy_request_ce->create_object = sf_proxy_request_object_create;
+    sf_proxy_request_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_READONLY_CLASS;
+
+    memcpy(&sf_proxy_request_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+    sf_proxy_request_object_handlers.offset = XtOffsetOf(sf_proxy_request_object, std);
+    sf_proxy_request_object_handlers.free_obj = sf_proxy_request_object_free;
+    sf_proxy_request_object_handlers.clone_obj = NULL;
+
+    /* Register ProxyResponse class */
+    INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "ProxyResponse", sf_proxy_response_methods);
+    sf_proxy_response_ce = zend_register_internal_class(&ce);
+    sf_proxy_response_ce->create_object = sf_proxy_response_object_create;
+    sf_proxy_response_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_READONLY_CLASS;
+
+    memcpy(&sf_proxy_response_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+    sf_proxy_response_object_handlers.offset = XtOffsetOf(sf_proxy_response_object, std);
+    sf_proxy_response_object_handlers.free_obj = sf_proxy_response_object_free;
+    sf_proxy_response_object_handlers.clone_obj = NULL;
 
     /* Register exception class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "RoutingException", NULL);

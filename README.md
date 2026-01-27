@@ -384,6 +384,116 @@ $cli->getHandler(); // [UserCommand::class, 'show']
 
 ---
 
+## Reverse Proxy
+
+Routes can proxy incoming requests to an upstream server. The router handles the full lifecycle: building the outgoing request from SAPI globals, calling optional hooks, executing the HTTP request via PHP streams, and sending the response back to the browser.
+
+### Basic proxy
+
+```php
+use Signalforge\Routing\Router;
+
+Router::get('/api/status', fn() => null)
+    ->proxy('https://api.internal/status');
+
+// During dispatch(), the router forwards the request to the upstream URL
+// and sends the response directly to the browser.
+$result = Router::dispatch();
+```
+
+The handler is still required by the route signature but is not called for proxy routes — `dispatch()` executes the proxy instead.
+
+### URL parameter substitution
+
+Proxy URLs can contain `{param}` placeholders that are resolved from the matched route parameters:
+
+```php
+Router::get('/api/users/{id}', fn($id) => null)
+    ->whereNumber('id')
+    ->proxy('https://api.internal/users/{id}');
+
+// GET /api/users/42 → proxies to https://api.internal/users/42
+```
+
+Parameter values are URL-encoded before substitution to prevent injection.
+
+### Request and response hooks
+
+`onRequest` modifies the outgoing request before it reaches the upstream. `onResponse` modifies the upstream response before it reaches the browser. Both receive immutable value objects and must return a new instance:
+
+```php
+use Signalforge\Routing\{Router, ProxyRequest, ProxyResponse};
+
+Router::get('/api/data', fn() => null)
+    ->proxy('https://backend.internal/data')
+    ->onRequest(function(ProxyRequest $req): ProxyRequest {
+        return $req->withHeader('Authorization', 'Bearer ' . getToken());
+    })
+    ->onResponse(function(ProxyResponse $resp): ProxyResponse {
+        return $resp->withHeader('X-Via', 'signalforge');
+    });
+```
+
+Calling `onRequest` or `onResponse` without first calling `proxy()` throws a `RoutingException`.
+
+### ProxyRequest
+
+`ProxyRequest` is an immutable value object representing the outgoing HTTP request. All `with*()` methods return a new instance:
+
+```php
+$req->getMethod();                    // 'GET'
+$req->getUrl();                       // 'https://...'
+$req->getHeaders();                   // ['accept' => '...', ...]
+$req->getHeader('content-type');      // 'application/json' or null
+$req->getBody();                      // request body or null
+
+$req->withMethod('POST');             // new instance with changed method
+$req->withUrl('https://other/path');  // new instance with changed URL
+$req->withHeader('X-Key', 'value');   // new instance with added/replaced header
+$req->withBody('{"key":"val"}');      // new instance with changed body
+$req->withoutHeader('accept');        // new instance with header removed
+```
+
+### ProxyResponse
+
+`ProxyResponse` is an immutable value object representing the upstream HTTP response:
+
+```php
+$resp->getStatusCode();               // 200
+$resp->getHeaders();                  // ['content-type' => '...', ...]
+$resp->getHeader('content-type');     // 'application/json' or null
+$resp->getBody();                     // response body
+
+$resp->withStatus(201);               // new instance with changed status
+$resp->withHeader('X-Cache', 'HIT'); // new instance with added/replaced header
+$resp->withBody('modified');          // new instance with changed body
+$resp->withoutHeader('server');       // new instance with header removed
+$resp->send();                        // send status + headers + body to browser
+```
+
+`dispatch()` calls `send()` automatically. You can also call it manually if you obtain the response from a `MatchResult`:
+
+```php
+$result = Router::dispatch();
+if ($result->isProxy()) {
+    $proxyResp = $result->getProxyResponse(); // ProxyResponse or null
+}
+```
+
+### Security
+
+The proxy implementation includes several protections:
+
+- **SSRF prevention**: Only `http://` and `https://` schemes are accepted. URLs are validated both at registration and after parameter substitution.
+- **Header injection**: Header values containing `\r` or `\n` are silently dropped.
+- **Sensitive header stripping**: Incoming `Cookie`, `Authorization`, `Proxy-Authorization`, and hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `TE`, `Upgrade`) are not forwarded to the upstream.
+- **Host rewriting**: The outgoing `Host` header is set to the upstream server's host, not the original request's host.
+- **Forwarding headers**: `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` are set automatically from the original request.
+- **Parameter encoding**: Route parameters substituted into proxy URLs are URL-encoded.
+- **Response size limit**: Upstream response bodies are capped at 64 MB.
+
+---
+
 ## API Reference
 
 ### Router (static)
@@ -428,6 +538,10 @@ $cli->getHandler(); // [UserCommand::class, 'show']
 | `defaults($param, $value)` | Default for optional param |
 | `domain($domain)` | Domain constraint |
 | `withoutMiddleware($middleware)` | Remove middleware |
+| `proxy($url)` | Proxy to upstream URL |
+| `onRequest($callback)` | Modify outgoing proxy request |
+| `onResponse($callback)` | Modify upstream proxy response |
+| `getProxyUrl()` | Get proxy URL or null |
 
 ### MatchResult
 
@@ -441,6 +555,37 @@ $cli->getHandler(); // [UserCommand::class, 'show']
 | `getRouteName()` | `?string` | Route name |
 | `getRoute()` | `?Route` | The Route object |
 | `getError()` | `?string` | Error message on failure |
+| `isProxy()` | `bool` | Whether proxy was executed |
+| `getProxyResponse()` | `?ProxyResponse` | Upstream response after proxy |
+
+### ProxyRequest
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getMethod()` | `string` | HTTP method |
+| `getUrl()` | `string` | Upstream URL |
+| `getHeaders()` | `array` | All headers |
+| `getHeader($name)` | `?string` | Single header by name |
+| `getBody()` | `?string` | Request body |
+| `withMethod($method)` | `ProxyRequest` | New instance with changed method |
+| `withUrl($url)` | `ProxyRequest` | New instance with changed URL |
+| `withHeader($name, $value)` | `ProxyRequest` | New instance with added/replaced header |
+| `withBody($body)` | `ProxyRequest` | New instance with changed body |
+| `withoutHeader($name)` | `ProxyRequest` | New instance with header removed |
+
+### ProxyResponse
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getStatusCode()` | `int` | HTTP status code |
+| `getHeaders()` | `array` | All headers |
+| `getHeader($name)` | `?string` | Single header by name |
+| `getBody()` | `string` | Response body |
+| `withStatus($code)` | `ProxyResponse` | New instance with changed status |
+| `withHeader($name, $value)` | `ProxyResponse` | New instance with added/replaced header |
+| `withBody($body)` | `ProxyResponse` | New instance with changed body |
+| `withoutHeader($name)` | `ProxyResponse` | New instance with header removed |
+| `send()` | `void` | Send status, headers, and body to browser |
 
 ### RoutingContext
 

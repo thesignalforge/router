@@ -181,4 +181,46 @@ final class Route
      * @return string|null
      */
     public function getDomain(): ?string {}
+
+    /**
+     * Configure this route as a proxy to an upstream URL.
+     *
+     * The URL may contain {param} placeholders that are resolved
+     * from matched route parameters during dispatch.
+     *
+     * @param string $url Upstream URL pattern
+     * @return $this
+     */
+    public function proxy(string $url): self {}
+
+    /**
+     * Register a callback to modify the outgoing proxy request.
+     *
+     * Called before the proxy HTTP request is sent. Must return
+     * a ProxyRequest instance (use with*() methods to modify).
+     * Requires proxy() to be called first.
+     *
+     * @param callable(ProxyRequest): ProxyRequest $callback
+     * @return $this
+     */
+    public function onRequest(callable $callback): self {}
+
+    /**
+     * Register a callback to modify the upstream proxy response.
+     *
+     * Called after the proxy HTTP response is received, before
+     * it is sent to the browser. Must return a ProxyResponse instance.
+     * Requires proxy() to be called first.
+     *
+     * @param callable(ProxyResponse): ProxyResponse $callback
+     * @return $this
+     */
+    public function onResponse(callable $callback): self {}
+
+    /**
+     * Get the proxy URL pattern, if configured.
+     *
+     * @return string|null
+     */
+    public function getProxyUrl(): ?string {}
 }
