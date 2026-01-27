@@ -48,6 +48,7 @@ extern zend_object_handlers sf_routing_context_object_handlers;
 /* Router PHP object */
 typedef struct _sf_router_object {
     sf_router *router;
+    zend_bool owns_router;  /* Whether this object owns (should free) the router */
     zend_object std;
 } sf_router_object;
 

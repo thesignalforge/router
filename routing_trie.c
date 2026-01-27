@@ -710,15 +710,6 @@ void sf_router_reset(sf_router *router)
     /* Pre-allocate new tries before destroying old ones for atomicity */
     for (i = 0; i < SF_METHOD_COUNT; i++) {
         new_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
-        if (!new_tries[i]) {
-            /* Allocation failed - clean up and abort */
-            for (int j = 0; j < i; j++) {
-                sf_trie_node_destroy(new_tries[j]);
-            }
-            php_error_docref(NULL, E_WARNING,
-                "Signalforge\\Routing: Failed to reset router - memory allocation failed");
-            return;
-        }
     }
 
     /* Write lock: reset modifies router state */
@@ -756,6 +747,13 @@ void sf_router_reset(sf_router *router)
         router->dispatch_domain = NULL;
     }
 
+    /* Destroy any remaining group context */
+    while (router->current_group) {
+        sf_route_group *parent = router->current_group->parent;
+        sf_route_group_destroy(router->current_group);
+        router->current_group = parent;
+    }
+
     router->is_immutable = 0;
     router->route_count = 0;
 
@@ -780,6 +778,10 @@ void sf_match_result_destroy(sf_match_result *result)
 {
     if (!result) {
         return;
+    }
+
+    if (result->route) {
+        sf_route_release(result->route);
     }
 
     if (result->params) {
@@ -1029,9 +1031,6 @@ static sf_trie_node *sf_trie_get_or_create_static_child(sf_trie_node *parent, ze
 
     /* Create new child */
     child = sf_trie_node_create(SF_NODE_STATIC);
-    if (!child) {
-        return NULL;
-    }
 
     child->segment = zend_string_copy(segment);
     child->depth = parent->depth + 1;
@@ -1077,9 +1076,6 @@ static sf_trie_node *sf_trie_get_or_create_param_child(sf_trie_node *parent,
 
     /* Create new child */
     sf_trie_node *child = sf_trie_node_create(type);
-    if (!child) {
-        return NULL;
-    }
 
     child->param_name = zend_string_copy(param_name);
     child->depth = parent->depth + 1;
@@ -1598,7 +1594,7 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
         if (cloned) {
             /* Find end of cloned list and count entries */
             sf_middleware_entry *cloned_tail = cloned;
-            uint16_t cloned_count = 1;
+            uint32_t cloned_count = 1;
             while (cloned_tail->next) {
                 cloned_tail = cloned_tail->next;
                 cloned_count++;
@@ -1614,18 +1610,6 @@ void sf_route_apply_group(sf_route *route, sf_route_group *group)
         }
     }
 
-    /* Apply wheres */
-    if (group->wheres) {
-        zend_string *key;
-        zval *val;
-        ZEND_HASH_FOREACH_STR_KEY_VAL(group->wheres, key, val) {
-            if (key && !route->wheres) {
-                sf_route_set_where(route, key, Z_STR_P(val));
-            } else if (key && !zend_hash_exists(route->wheres, key)) {
-                sf_route_set_where(route, key, Z_STR_P(val));
-            }
-        } ZEND_HASH_FOREACH_END();
-    }
 }
 
 /* ============================================================================
@@ -1814,6 +1798,7 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
         if (EXPECTED(sf_validate_params(matched_node->route, result->params))) {
             result->matched = 1;
             result->route = matched_node->route;
+            sf_route_addref(result->route);
 
             /* Apply default values for missing optional parameters */
             if (UNEXPECTED(matched_node->route->defaults != NULL)) {
@@ -1837,6 +1822,7 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
         if (router->fallback_route) {
             result->matched = 1;
             result->route = router->fallback_route;
+            sf_route_addref(result->route);
         } else {
             result->matched = 0;
             result->error = zend_string_init("Route not found",
@@ -1884,7 +1870,10 @@ sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method met
             if (rc < 0) {
                 pcre2_match_data_free(match_data);
                 result->matched = 0;
-                result->route = NULL;
+                if (result->route) {
+                    sf_route_release(result->route);
+                    result->route = NULL;
+                }
                 if (result->error) {
                     zend_string_release(result->error);
                 }
@@ -1929,7 +1918,10 @@ sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method met
             if (domain_len != ZSTR_LEN(result->route->domain) ||
                 memcmp(domain, ZSTR_VAL(result->route->domain), domain_len) != 0) {
                 result->matched = 0;
-                result->route = NULL;
+                if (result->route) {
+                    sf_route_release(result->route);
+                    result->route = NULL;
+                }
                 if (result->error) {
                     zend_string_release(result->error);
                 }
@@ -2021,6 +2013,12 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
             while (ptr < end && *ptr != '}') {
                 ptr++;
             }
+            if (ptr >= end) {
+                /* Unclosed '{' - append remaining literal and stop */
+                smart_str_appendc(&url, '{');
+                smart_str_appendl(&url, param_start, ptr - param_start);
+                break;
+            }
 
             size_t param_len = ptr - param_start;
             zend_bool is_optional = 0;
@@ -2030,8 +2028,11 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
                 is_optional = 1;
                 param_len--;
             }
-            /* Handle wildcard marker */
-            if (param_len > 0 && param_start[param_len - 1] == '*') {
+            /* Handle wildcard marker: {path*} or {path...} */
+            if (param_len >= 3 && param_start[param_len - 3] == '.' &&
+                param_start[param_len - 2] == '.' && param_start[param_len - 1] == '.') {
+                param_len -= 3;
+            } else if (param_len > 0 && param_start[param_len - 1] == '*') {
                 param_len--;
             }
 
@@ -2289,10 +2290,12 @@ static void sf_buf_write_string(sf_write_buffer *buf, zend_string *str)
     if (str && ZSTR_LEN(str) > 0) {
         if (UNEXPECTED(ZSTR_LEN(str) > 65535)) {
             php_error_docref(NULL, E_WARNING,
-                "Signalforge\\Routing: String truncated during serialization "
+                "Signalforge\\Routing: String too long for serialization "
                 "(length %zu exceeds 65535 byte limit)", ZSTR_LEN(str));
+            buf->failed = 1;
+            return;
         }
-        uint16_t len = (uint16_t)(ZSTR_LEN(str) > 65535 ? 65535 : ZSTR_LEN(str));
+        uint16_t len = (uint16_t)ZSTR_LEN(str);
         sf_buf_write_u16(buf, len);
         sf_buf_write_bytes(buf, ZSTR_VAL(str), len);
     } else {
@@ -2375,7 +2378,7 @@ static void sf_serialize_route_bin(sf_write_buffer *buf, sf_route *route)
     /* Method */
     sf_buf_write_u8(buf, (uint8_t)route->method);
 
-    /* Middleware */
+    /* Middleware (names only - parameters are not serialized; known limitation) */
     sf_buf_write_u16(buf, route->middleware_count);
     sf_middleware_entry *mw = route->middleware_head;
     while (mw) {
@@ -2554,6 +2557,13 @@ static sf_route *sf_deserialize_route_bin(sf_read_buffer *buf)
         sf_route_destroy(route);
         return NULL;
     }
+    if (mw_count > SF_MAX_MIDDLEWARE_COUNT) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: Invalid cache - middleware count %u exceeds maximum %d",
+            mw_count, SF_MAX_MIDDLEWARE_COUNT);
+        sf_route_destroy(route);
+        return NULL;
+    }
     for (uint16_t i = 0; i < mw_count; i++) {
         zend_string *mw_name = sf_buf_read_string(buf);
         if (mw_name) {
@@ -2674,7 +2684,6 @@ static sf_trie_node *sf_deserialize_node_bin_internal(sf_read_buffer *buf, int d
             node->constraint = sf_constraint_create(node->param_name);
             if (node->constraint) {
                 sf_constraint_set_pattern(node->constraint, pattern);
-                node->constraint->validator = (sf_validator_type)validator_type;
             }
             zend_string_release(pattern);
         } else if (pattern) {
@@ -2768,6 +2777,9 @@ zend_string *sf_router_serialize(sf_router *router)
     sf_write_buffer buf;
     sf_buf_init(&buf, SF_INITIAL_BUFFER_SIZE);
 
+    /* Read lock: serialization only reads router state */
+    SF_ROUTER_RDLOCK(router);
+
     /* Header: magic (4) + version (1) + flags (1) + route_count (4) + reserved (6) = 16 bytes */
     sf_buf_write_bytes(&buf, SF_CACHE_MAGIC, 4);
     sf_buf_write_u8(&buf, SF_CACHE_VERSION);
@@ -2776,9 +2788,6 @@ zend_string *sf_router_serialize(sf_router *router)
     /* 6 bytes reserved */
     sf_buf_write_u16(&buf, 0);
     sf_buf_write_u32(&buf, 0);
-
-    /* Read lock: serialization only reads router state */
-    SF_ROUTER_RDLOCK(router);
 
     /* Serialize each method trie */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
@@ -2853,32 +2862,17 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
     /* Skip flags and route count and reserved */
     buf.pos = 16;
 
-    /* Create router */
-    sf_router *router = ecalloc(1, sizeof(sf_router));
+    /* Create router using standard initializer */
+    sf_router *router = sf_router_create();
 
-    /* Initialize named routes hash table */
-    ALLOC_HASHTABLE(router->named_routes);
-    zend_hash_init(router->named_routes, SF_NAMED_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
-
-    /* Initialize all routes hash table */
-    ALLOC_HASHTABLE(router->all_routes);
-    zend_hash_init(router->all_routes, SF_ALL_ROUTES_INITIAL_SIZE, NULL, NULL, 0);
-
-#ifdef ZTS
-#ifdef _WIN32
-    InitializeSRWLock(&router->lock);
-#else
-    pthread_rwlock_init(&router->lock, NULL);
-#endif
-#endif
-
-    /* Deserialize each method trie */
+    /* Deserialize each method trie, replacing the default empty roots */
     for (int i = 0; i < SF_METHOD_COUNT; i++) {
-        router->method_tries[i] = sf_deserialize_node_bin(&buf);
-        if (!router->method_tries[i]) {
-            /* Create empty root node if deserialization failed */
-            router->method_tries[i] = sf_trie_node_create(SF_NODE_ROOT);
+        sf_trie_node *deserialized = sf_deserialize_node_bin(&buf);
+        if (deserialized) {
+            sf_trie_node_destroy_recursive(router->method_tries[i]);
+            router->method_tries[i] = deserialized;
         }
+        /* Otherwise keep the empty root from sf_router_create() */
     }
 
     /* Rebuild named routes index by traversing tries */
@@ -2922,9 +2916,10 @@ zend_bool sf_router_cache_to_file(sf_router *router, const char *path)
     /* Release lock and close stream */
     php_stream_lock(stream, LOCK_UN);
     php_stream_close(stream);
+    size_t serialized_len = ZSTR_LEN(serialized);
     zend_string_release(serialized);
 
-    return written == ZSTR_LEN(serialized);
+    return written == serialized_len;
 }
 
 sf_router *sf_router_load_from_file(const char *path)

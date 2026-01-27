@@ -43,6 +43,7 @@ zend_object *sf_router_object_create(zend_class_entry *ce)
     object_properties_init(&intern->std, ce);
 
     intern->router = NULL;
+    intern->owns_router = 0;
     intern->std.handlers = &sf_router_object_handlers;
 
     return &intern->std;
@@ -52,7 +53,7 @@ void sf_router_object_free(zend_object *obj)
 {
     sf_router_object *intern = sf_router_object_from_zend_object(obj);
 
-    if (intern->router && intern->router != SF_G(global_router)) {
+    if (intern->router && intern->owns_router) {
         sf_router_destroy(intern->router);
     }
 
@@ -77,6 +78,7 @@ void sf_route_object_free(zend_object *obj)
     sf_route_object *intern = sf_route_object_from_zend_object(obj);
 
     if (intern->route) {
+        intern->route->php_object = NULL;
         sf_route_release(intern->route);
     }
 
@@ -353,6 +355,7 @@ PHP_METHOD(Signalforge_Routing_Router, group)
 
     /* Call the callback */
     zval retval;
+    ZVAL_UNDEF(&retval);
     fci.retval = &retval;
     if (zend_call_function(&fci, &fcc) == FAILURE || EG(exception)) {
         sf_router_end_group(router);
@@ -712,6 +715,8 @@ PHP_METHOD(Signalforge_Routing_Router, routeUsing)
     router->dispatch_domain = ctx->domain ? zend_string_copy(ctx->domain) : NULL;
 
     zval_ptr_dtor(&retval);
+
+    RETURN_NULL();
 }
 
 PHP_METHOD(Signalforge_Routing_Router, dispatch)
@@ -924,6 +929,13 @@ PHP_METHOD(Signalforge_Routing_Route, whereIn)
     sf_route_object *intern = Z_ROUTE_OBJ_P(ZEND_THIS);
     if (!intern->route) {
         zend_throw_exception(sf_routing_exception_ce, "Invalid route", 0);
+        RETURN_THROWS();
+    }
+
+    /* Reject empty values array */
+    if (zend_hash_num_elements(Z_ARRVAL_P(values)) == 0) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "whereIn() requires a non-empty values array", 0);
         RETURN_THROWS();
     }
 

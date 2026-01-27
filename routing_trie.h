@@ -171,7 +171,7 @@ struct _sf_trie_node {
 
 /* Match result structure */
 struct _sf_match_result {
-    sf_route *route;                /* Matched route (borrowed reference) */
+    sf_route *route;                /* Matched route (owned reference) */
     HashTable *params;              /* Extracted parameters {name => value} */
     zend_bool matched;              /* Whether a match was found */
     zend_string *error;             /* Error message if match failed */
@@ -317,10 +317,6 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
 sf_match_result *sf_trie_match_with_domain(sf_router *router, sf_http_method method,
                                            const char *uri, size_t uri_len,
                                            const char *domain, size_t domain_len);
-
-/* Internal matching - returns matched node */
-sf_trie_node *sf_trie_match_node(sf_trie_node *root, const char *uri, size_t uri_len,
-                                 HashTable *params);
 
 /* Validate extracted parameters against constraints */
 zend_bool sf_validate_params(sf_route *route, HashTable *params);
