@@ -56,6 +56,9 @@ typedef struct _sf_route_group sf_route_group;
 typedef struct _sf_match_result sf_match_result;
 typedef struct _sf_router sf_router;
 typedef struct _sf_routing_context sf_routing_context;
+typedef struct _sf_proxy_options sf_proxy_options;
+typedef struct _sf_proxy_request sf_proxy_request;
+typedef struct _sf_proxy_response sf_proxy_response;
 
 /* HTTP method enumeration */
 typedef enum {
@@ -129,6 +132,7 @@ struct _sf_route {
     sf_http_method method;          /* HTTP method (4 bytes) */
     uint8_t is_fallback;            /* Is this a fallback route */
     uint8_t _padding[3];            /* Alignment padding */
+    sf_proxy_options *proxy;        /* Proxy config (nullable - NULL means not a proxy route) */
 };
 
 /*
@@ -175,6 +179,7 @@ struct _sf_match_result {
     HashTable *params;              /* Extracted parameters {name => value} */
     zend_bool matched;              /* Whether a match was found */
     zend_string *error;             /* Error message if match failed */
+    sf_proxy_response *proxy_response; /* Set after proxy execution (nullable) */
 };
 
 /* Route group context */
@@ -194,6 +199,30 @@ struct _sf_routing_context {
     zend_string *method;
     zend_string *path;
     zend_string *domain;            /* nullable */
+};
+
+/* Proxy configuration stored on a route */
+struct _sf_proxy_options {
+    zend_string *url;                /* Upstream URL pattern (may contain {param} placeholders) */
+    zval on_request;                 /* ?callable(ProxyRequest): ProxyRequest */
+    zval on_response;                /* ?callable(ProxyResponse): ProxyResponse */
+    double timeout;                  /* Timeout in seconds (default 30.0) */
+    zend_bool verify_ssl;            /* Verify SSL certificates (default true) */
+};
+
+/* Immutable proxy request value object - outgoing request to upstream */
+struct _sf_proxy_request {
+    zend_string *method;             /* HTTP method */
+    zend_string *url;                /* Resolved upstream URL */
+    HashTable *headers;              /* {lowercase_name => zend_string* value} */
+    zend_string *body;               /* Request body (nullable) */
+};
+
+/* Immutable proxy response value object - upstream response */
+struct _sf_proxy_response {
+    uint16_t status_code;            /* HTTP status code */
+    HashTable *headers;              /* {lowercase_name => zend_string* value} */
+    zend_string *body;               /* Response body */
 };
 
 /* Router state */
@@ -268,6 +297,22 @@ void sf_routing_context_destroy(sf_routing_context *ctx);
 /* Route group lifecycle */
 sf_route_group *sf_route_group_create(void);
 void sf_route_group_destroy(sf_route_group *group);
+
+/* Proxy options lifecycle */
+sf_proxy_options *sf_proxy_options_create(zend_string *url);
+void sf_proxy_options_destroy(sf_proxy_options *opts);
+
+/* Proxy request lifecycle */
+sf_proxy_request *sf_proxy_request_create(zend_string *method, zend_string *url,
+                                           HashTable *headers, zend_string *body);
+sf_proxy_request *sf_proxy_request_clone(sf_proxy_request *req);
+void sf_proxy_request_destroy(sf_proxy_request *req);
+
+/* Proxy response lifecycle */
+sf_proxy_response *sf_proxy_response_create(uint16_t status_code, HashTable *headers,
+                                             zend_string *body);
+sf_proxy_response *sf_proxy_response_clone(sf_proxy_response *resp);
+void sf_proxy_response_destroy(sf_proxy_response *resp);
 
 /* ============================================================================
  * Route Registration Functions
@@ -446,6 +491,15 @@ void sf_route_dump(sf_route *route);
 #define SF_CONSTRAINTS_INITIAL_SIZE 8
 #define SF_DEFAULTS_INITIAL_SIZE 8
 #define SF_PARAMS_INITIAL_SIZE 8
+#define SF_HEADERS_INITIAL_SIZE 16
+
+/* Proxy constants */
+#define SF_HTTP_PREFIX "HTTP_"
+#define SF_HTTP_PREFIX_LEN (sizeof(SF_HTTP_PREFIX) - 1)
+#define SF_PROXY_DEFAULT_TIMEOUT 30.0
+#define SF_PROXY_MAX_RESPONSE_BODY (64 * 1024 * 1024)  /* 64 MB */
+#define SF_PROXY_MIN_STATUS 100
+#define SF_PROXY_MAX_STATUS 599
 
 /* ============================================================================
  * Error Codes

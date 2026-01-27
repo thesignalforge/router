@@ -194,6 +194,10 @@ void sf_route_destroy(sf_route *route)
         pcre2_code_free(route->domain_regex);
     }
 
+    if (route->proxy) {
+        sf_proxy_options_destroy(route->proxy);
+    }
+
     efree(route);
 }
 
@@ -793,6 +797,10 @@ void sf_match_result_destroy(sf_match_result *result)
         zend_string_release(result->error);
     }
 
+    if (result->proxy_response) {
+        sf_proxy_response_destroy(result->proxy_response);
+    }
+
     efree(result);
 }
 
@@ -825,6 +833,144 @@ void sf_routing_context_destroy(sf_routing_context *ctx)
         zend_string_release(ctx->domain);
     }
     efree(ctx);
+}
+
+/* ============================================================================
+ * Proxy Lifecycle Functions
+ * ============================================================================ */
+
+sf_proxy_options *sf_proxy_options_create(zend_string *url)
+{
+    sf_proxy_options *opts = ecalloc(1, sizeof(sf_proxy_options));
+    opts->url = zend_string_copy(url);
+    ZVAL_UNDEF(&opts->on_request);
+    ZVAL_UNDEF(&opts->on_response);
+    opts->timeout = SF_PROXY_DEFAULT_TIMEOUT;
+    opts->verify_ssl = 1;
+    return opts;
+}
+
+void sf_proxy_options_destroy(sf_proxy_options *opts)
+{
+    if (!opts) {
+        return;
+    }
+
+    if (opts->url) {
+        zend_string_release(opts->url);
+    }
+
+    if (!Z_ISUNDEF(opts->on_request)) {
+        zval_ptr_dtor(&opts->on_request);
+    }
+    if (!Z_ISUNDEF(opts->on_response)) {
+        zval_ptr_dtor(&opts->on_response);
+    }
+
+    efree(opts);
+}
+
+static void sf_proxy_headers_copy(HashTable *dest, HashTable *src)
+{
+    zend_string *key;
+    zval *val;
+
+    ZEND_HASH_FOREACH_STR_KEY_VAL(src, key, val) {
+        if (key && Z_TYPE_P(val) == IS_STRING) {
+            zval copy;
+            ZVAL_STR_COPY(&copy, Z_STR_P(val));
+            zend_hash_update(dest, key, &copy);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+sf_proxy_request *sf_proxy_request_create(zend_string *method, zend_string *url,
+                                           HashTable *headers, zend_string *body)
+{
+    sf_proxy_request *req = ecalloc(1, sizeof(sf_proxy_request));
+    req->method = zend_string_copy(method);
+    req->url = zend_string_copy(url);
+
+    ALLOC_HASHTABLE(req->headers);
+    zend_hash_init(req->headers, SF_HEADERS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
+    if (headers) {
+        sf_proxy_headers_copy(req->headers, headers);
+    }
+
+    req->body = body ? zend_string_copy(body) : NULL;
+    return req;
+}
+
+sf_proxy_request *sf_proxy_request_clone(sf_proxy_request *req)
+{
+    if (!req) {
+        return NULL;
+    }
+    return sf_proxy_request_create(req->method, req->url, req->headers, req->body);
+}
+
+void sf_proxy_request_destroy(sf_proxy_request *req)
+{
+    if (!req) {
+        return;
+    }
+
+    if (req->method) {
+        zend_string_release(req->method);
+    }
+    if (req->url) {
+        zend_string_release(req->url);
+    }
+    if (req->headers) {
+        zend_hash_destroy(req->headers);
+        FREE_HASHTABLE(req->headers);
+    }
+    if (req->body) {
+        zend_string_release(req->body);
+    }
+
+    efree(req);
+}
+
+sf_proxy_response *sf_proxy_response_create(uint16_t status_code, HashTable *headers,
+                                             zend_string *body)
+{
+    sf_proxy_response *resp = ecalloc(1, sizeof(sf_proxy_response));
+    resp->status_code = status_code;
+
+    ALLOC_HASHTABLE(resp->headers);
+    zend_hash_init(resp->headers, SF_HEADERS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
+    if (headers) {
+        sf_proxy_headers_copy(resp->headers, headers);
+    }
+
+    resp->body = body ? zend_string_copy(body) : NULL;
+    return resp;
+}
+
+sf_proxy_response *sf_proxy_response_clone(sf_proxy_response *resp)
+{
+    if (!resp) {
+        return NULL;
+    }
+    return sf_proxy_response_create(resp->status_code, resp->headers, resp->body);
+}
+
+void sf_proxy_response_destroy(sf_proxy_response *resp)
+{
+    if (!resp) {
+        return;
+    }
+
+    if (resp->headers) {
+        zend_hash_destroy(resp->headers);
+        FREE_HASHTABLE(resp->headers);
+    }
+    if (resp->body) {
+        zend_string_release(resp->body);
+    }
+
+    efree(resp);
 }
 
 /* ============================================================================

@@ -81,4 +81,21 @@ final readonly class MatchResult
      * @return mixed Parameter value or default
      */
     public function param(string $name, mixed $default = null): mixed {}
+
+    /**
+     * Check if this match result has a proxy response.
+     *
+     * Returns true when the matched route had proxy() configured
+     * and the proxy was executed during dispatch().
+     *
+     * @return bool
+     */
+    public function isProxy(): bool {}
+
+    /**
+     * Get the proxy response, if available.
+     *
+     * @return ProxyResponse|null
+     */
+    public function getProxyResponse(): ?ProxyResponse {}
 }
