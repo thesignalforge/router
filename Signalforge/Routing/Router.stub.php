@@ -231,4 +231,36 @@ final class Router
      * @return Router
      */
     public static function getInstance(): Router {}
+
+    /**
+     * Register a CLI command route.
+     *
+     * Uses colon-separated command names (e.g., 'cache:clear', 'users:{id}:delete').
+     * Parameters and constraints work the same as HTTP routes.
+     *
+     * @param string $command Colon-separated command pattern
+     * @param mixed $handler Any PHP callable
+     * @return Route The created route for method chaining
+     */
+    public static function cli(string $command, mixed $handler): Route {}
+
+    /**
+     * Bind input and resolver for dispatch.
+     *
+     * The resolver receives the input and must return a RoutingContext instance
+     * containing the method, path, and optional domain to route against.
+     *
+     * @param mixed $input The request object, array, or any value to pass to the resolver
+     * @param callable $resolver Callback that receives $input and returns RoutingContext
+     * @return void
+     */
+    public static function routeUsing(mixed $input, callable $resolver): void {}
+
+    /**
+     * Dispatch using the context set by routeUsing().
+     *
+     * @return MatchResult The match result
+     * @throws RoutingException If routeUsing() has not been called
+     */
+    public static function dispatch(): MatchResult {}
 }

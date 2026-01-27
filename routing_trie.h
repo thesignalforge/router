@@ -55,6 +55,7 @@ typedef struct _sf_route sf_route;
 typedef struct _sf_route_group sf_route_group;
 typedef struct _sf_match_result sf_match_result;
 typedef struct _sf_router sf_router;
+typedef struct _sf_routing_context sf_routing_context;
 
 /* HTTP method enumeration */
 typedef enum {
@@ -66,7 +67,8 @@ typedef enum {
     SF_METHOD_OPTIONS = 5,
     SF_METHOD_HEAD    = 6,
     SF_METHOD_ANY     = 7,
-    SF_METHOD_COUNT   = 8
+    SF_METHOD_CLI     = 8,
+    SF_METHOD_COUNT   = 9
 } sf_http_method;
 
 /* Trie node type enumeration */
@@ -187,6 +189,13 @@ struct _sf_route_group {
     struct _sf_route_group *parent; /* Parent group (for nesting) */
 };
 
+/* Routing context - stores resolved method/path/domain for dispatch */
+struct _sf_routing_context {
+    zend_string *method;
+    zend_string *path;
+    zend_string *domain;            /* nullable */
+};
+
 /* Router state */
 struct _sf_router {
     sf_trie_node *method_tries[SF_METHOD_COUNT]; /* Per-method trie roots */
@@ -197,6 +206,11 @@ struct _sf_router {
     zend_bool is_immutable;         /* Locked during request */
     zend_bool trailing_slash_strict;/* Strict trailing slash matching */
     uint32_t route_count;           /* Total route count */
+
+    /* Dispatch context - set by routeUsing(), consumed by dispatch() */
+    zend_string *dispatch_method;
+    zend_string *dispatch_path;
+    zend_string *dispatch_domain;   /* nullable */
 
 #ifdef ZTS
     /* Read-write lock for thread safety:
@@ -246,6 +260,10 @@ void sf_router_reset(sf_router *router);
 /* Match result lifecycle */
 sf_match_result *sf_match_result_create(void);
 void sf_match_result_destroy(sf_match_result *result);
+
+/* Routing context lifecycle */
+sf_routing_context *sf_routing_context_create(zend_string *method, zend_string *path, zend_string *domain);
+void sf_routing_context_destroy(sf_routing_context *ctx);
 
 /* Route group lifecycle */
 sf_route_group *sf_route_group_create(void);
@@ -361,6 +379,9 @@ const char *sf_method_to_string(sf_http_method method);
 
 /* Normalize URI (trailing slash handling) */
 zend_string *sf_normalize_uri(const char *uri, size_t len, zend_bool strip_trailing);
+
+/* Normalize CLI path (colon-separated to slash-separated) */
+zend_string *sf_normalize_cli_path(const char *path, size_t len);
 
 /* Debug: dump trie structure */
 void sf_trie_dump(sf_trie_node *node, int depth);

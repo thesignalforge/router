@@ -22,12 +22,14 @@ ZEND_DECLARE_MODULE_GLOBALS(signalforge_routing)
 zend_class_entry *sf_router_ce = NULL;
 zend_class_entry *sf_route_ce = NULL;
 zend_class_entry *sf_match_result_ce = NULL;
+zend_class_entry *sf_routing_context_ce = NULL;
 zend_class_entry *sf_routing_exception_ce = NULL;
 
 /* Object handlers */
 zend_object_handlers sf_router_object_handlers;
 zend_object_handlers sf_route_object_handlers;
 zend_object_handlers sf_match_result_object_handlers;
+zend_object_handlers sf_routing_context_object_handlers;
 
 /* ============================================================================
  * Object Creation and Destruction
@@ -100,6 +102,30 @@ void sf_match_result_object_free(zend_object *obj)
 
     if (intern->result) {
         sf_match_result_destroy(intern->result);
+    }
+
+    zend_object_std_dtor(&intern->std);
+}
+
+zend_object *sf_routing_context_object_create(zend_class_entry *ce)
+{
+    sf_routing_context_object *intern = zend_object_alloc(sizeof(sf_routing_context_object), ce);
+
+    zend_object_std_init(&intern->std, ce);
+    object_properties_init(&intern->std, ce);
+
+    intern->context = NULL;
+    intern->std.handlers = &sf_routing_context_object_handlers;
+
+    return &intern->std;
+}
+
+void sf_routing_context_object_free(zend_object *obj)
+{
+    sf_routing_context_object *intern = sf_routing_context_object_from_zend_object(obj);
+
+    if (intern->context) {
+        sf_routing_context_destroy(intern->context);
     }
 
     zend_object_std_dtor(&intern->std);
@@ -610,6 +636,119 @@ PHP_METHOD(Signalforge_Routing_Router, getInstance)
     object_init_ex(return_value, sf_router_ce);
     sf_router_object *obj = Z_ROUTER_OBJ_P(return_value);
     obj->router = sf_get_global_router();
+}
+
+PHP_METHOD(Signalforge_Routing_Router, cli)
+{
+    sf_router_register_method(INTERNAL_FUNCTION_PARAM_PASSTHRU, SF_METHOD_CLI);
+}
+
+PHP_METHOD(Signalforge_Routing_Router, routeUsing)
+{
+    zval *input;
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_ZVAL(input)
+        Z_PARAM_FUNC(fci, fcc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* Call the resolver with $input as argument */
+    zval retval;
+    zval args[1];
+    ZVAL_COPY_VALUE(&args[0], input);
+
+    fci.retval = &retval;
+    fci.param_count = 1;
+    fci.params = args;
+
+    if (zend_call_function(&fci, &fcc) != SUCCESS) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Failed to call routing resolver", 0);
+        RETURN_THROWS();
+    }
+
+    /* Check for exception thrown inside resolver */
+    if (EG(exception)) {
+        zval_ptr_dtor(&retval);
+        RETURN_THROWS();
+    }
+
+    /* Validate return type is RoutingContext */
+    if (Z_TYPE(retval) != IS_OBJECT || !instanceof_function(Z_OBJCE(retval), sf_routing_context_ce)) {
+        zval_ptr_dtor(&retval);
+        zend_throw_exception(sf_routing_exception_ce,
+            "Resolver must return a RoutingContext instance", 0);
+        RETURN_THROWS();
+    }
+
+    /* Extract context from the returned object */
+    sf_routing_context_object *ctx_obj = sf_routing_context_object_from_zend_object(Z_OBJ(retval));
+    sf_routing_context *ctx = ctx_obj->context;
+
+    if (!ctx || !ctx->method || !ctx->path) {
+        zval_ptr_dtor(&retval);
+        zend_throw_exception(sf_routing_exception_ce,
+            "RoutingContext has invalid state", 0);
+        RETURN_THROWS();
+    }
+
+    /* Store dispatch context in the router */
+    sf_router *router = sf_get_global_router();
+
+    if (router->dispatch_method) {
+        zend_string_release(router->dispatch_method);
+    }
+    if (router->dispatch_path) {
+        zend_string_release(router->dispatch_path);
+    }
+    if (router->dispatch_domain) {
+        zend_string_release(router->dispatch_domain);
+    }
+
+    router->dispatch_method = zend_string_copy(ctx->method);
+    router->dispatch_path = zend_string_copy(ctx->path);
+    router->dispatch_domain = ctx->domain ? zend_string_copy(ctx->domain) : NULL;
+
+    zval_ptr_dtor(&retval);
+}
+
+PHP_METHOD(Signalforge_Routing_Router, dispatch)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_router *router = sf_get_global_router();
+
+    if (!router->dispatch_method) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "No routing context set. Call Router::routeUsing() before Router::dispatch()", 0);
+        RETURN_THROWS();
+    }
+
+    sf_http_method method = sf_method_from_string(
+        ZSTR_VAL(router->dispatch_method), ZSTR_LEN(router->dispatch_method));
+
+    sf_match_result *result;
+    if (router->dispatch_domain) {
+        result = sf_trie_match_with_domain(router, method,
+            ZSTR_VAL(router->dispatch_path), ZSTR_LEN(router->dispatch_path),
+            ZSTR_VAL(router->dispatch_domain), ZSTR_LEN(router->dispatch_domain));
+    } else {
+        result = sf_trie_match(router, method,
+            ZSTR_VAL(router->dispatch_path), ZSTR_LEN(router->dispatch_path));
+    }
+
+    if (!result) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Dispatch operation failed", 0);
+        RETURN_THROWS();
+    }
+
+    /* Return MatchResult object */
+    object_init_ex(return_value, sf_match_result_ce);
+    sf_match_result_object *result_obj = Z_MATCH_RESULT_OBJ_P(return_value);
+    result_obj->result = result;
 }
 
 /* ============================================================================
@@ -1183,6 +1322,63 @@ PHP_METHOD(Signalforge_Routing_MatchResult, param)
 }
 
 /* ============================================================================
+ * RoutingContext Methods
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_RoutingContext, __construct)
+{
+    zend_string *method;
+    zend_string *path;
+    zend_string *domain = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STR(method)
+        Z_PARAM_STR(path)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STR_OR_NULL(domain)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_routing_context_object *intern = Z_ROUTING_CONTEXT_OBJ_P(ZEND_THIS);
+    intern->context = sf_routing_context_create(method, path, domain);
+}
+
+PHP_METHOD(Signalforge_Routing_RoutingContext, getMethod)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_routing_context_object *intern = Z_ROUTING_CONTEXT_OBJ_P(ZEND_THIS);
+    if (!intern->context || !intern->context->method) {
+        RETURN_STRING("");
+    }
+
+    RETURN_STR_COPY(intern->context->method);
+}
+
+PHP_METHOD(Signalforge_Routing_RoutingContext, getPath)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_routing_context_object *intern = Z_ROUTING_CONTEXT_OBJ_P(ZEND_THIS);
+    if (!intern->context || !intern->context->path) {
+        RETURN_STRING("");
+    }
+
+    RETURN_STR_COPY(intern->context->path);
+}
+
+PHP_METHOD(Signalforge_Routing_RoutingContext, getDomain)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_routing_context_object *intern = Z_ROUTING_CONTEXT_OBJ_P(ZEND_THIS);
+    if (!intern->context || !intern->context->domain) {
+        RETURN_NULL();
+    }
+
+    RETURN_STR_COPY(intern->context->domain);
+}
+
+/* ============================================================================
  * Argument Info Definitions
  * ============================================================================ */
 
@@ -1261,6 +1457,35 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_dump, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_getInstance, 0, 0, Signalforge\\Routing\\Router, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_cli, 0, 2, Signalforge\\Routing\\Route, 0)
+    ZEND_ARG_TYPE_INFO(0, command, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, handler, IS_MIXED, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_routeUsing, 0, 2, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, input, IS_MIXED, 0)
+    ZEND_ARG_TYPE_INFO(0, resolver, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_dispatch, 0, 0, Signalforge\\Routing\\MatchResult, 0)
+ZEND_END_ARG_INFO()
+
+/* RoutingContext arg info */
+ZEND_BEGIN_ARG_INFO_EX(arginfo_routing_context_construct, 0, 0, 2)
+    ZEND_ARG_TYPE_INFO(0, method, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, domain, IS_STRING, 1, "null")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_routing_context_getMethod, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_routing_context_getPath, 0, 0, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_routing_context_getDomain, 0, 0, IS_STRING, 1)
 ZEND_END_ARG_INFO()
 
 /* Route arg info */
@@ -1386,6 +1611,9 @@ static const zend_function_entry sf_router_methods[] = {
     PHP_ME(Signalforge_Routing_Router, setStrictSlashes, arginfo_router_setStrictSlashes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, dump, arginfo_router_dump, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, getInstance, arginfo_router_getInstance, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, cli, arginfo_router_cli, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, routeUsing, arginfo_router_routeUsing, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, dispatch, arginfo_router_dispatch, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
 
@@ -1424,6 +1652,14 @@ static const zend_function_entry sf_match_result_methods[] = {
     PHP_ME(Signalforge_Routing_MatchResult, getRouteName, arginfo_match_getRouteName, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, getError, arginfo_match_getError, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, param, arginfo_match_param, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+static const zend_function_entry sf_routing_context_methods[] = {
+    PHP_ME(Signalforge_Routing_RoutingContext, __construct, arginfo_routing_context_construct, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_RoutingContext, getMethod, arginfo_routing_context_getMethod, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_RoutingContext, getPath, arginfo_routing_context_getPath, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_RoutingContext, getDomain, arginfo_routing_context_getDomain, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -1482,6 +1718,16 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_match_result_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_match_result_object_handlers.offset = XtOffsetOf(sf_match_result_object, std);
     sf_match_result_object_handlers.free_obj = sf_match_result_object_free;
+
+    /* Register RoutingContext class */
+    INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "RoutingContext", sf_routing_context_methods);
+    sf_routing_context_ce = zend_register_internal_class(&ce);
+    sf_routing_context_ce->create_object = sf_routing_context_object_create;
+    sf_routing_context_ce->ce_flags |= ZEND_ACC_FINAL;
+
+    memcpy(&sf_routing_context_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+    sf_routing_context_object_handlers.offset = XtOffsetOf(sf_routing_context_object, std);
+    sf_routing_context_object_handlers.free_obj = sf_routing_context_object_free;
 
     /* Register exception class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "RoutingException", NULL);

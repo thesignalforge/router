@@ -32,12 +32,14 @@ extern zend_module_entry signalforge_routing_module_entry;
 extern zend_class_entry *sf_router_ce;
 extern zend_class_entry *sf_route_ce;
 extern zend_class_entry *sf_match_result_ce;
+extern zend_class_entry *sf_routing_context_ce;
 extern zend_class_entry *sf_routing_exception_ce;
 
 /* Object handlers */
 extern zend_object_handlers sf_router_object_handlers;
 extern zend_object_handlers sf_route_object_handlers;
 extern zend_object_handlers sf_match_result_object_handlers;
+extern zend_object_handlers sf_routing_context_object_handlers;
 
 /* ============================================================================
  * PHP Object Structures
@@ -61,6 +63,12 @@ typedef struct _sf_match_result_object {
     zend_object std;
 } sf_match_result_object;
 
+/* RoutingContext PHP object */
+typedef struct _sf_routing_context_object {
+    sf_routing_context *context;
+    zend_object std;
+} sf_routing_context_object;
+
 /* ============================================================================
  * Object Accessor Macros
  * ============================================================================ */
@@ -80,6 +88,11 @@ static inline sf_match_result_object *sf_match_result_object_from_zend_object(ze
 }
 #define Z_MATCH_RESULT_OBJ_P(zv) sf_match_result_object_from_zend_object(Z_OBJ_P(zv))
 
+static inline sf_routing_context_object *sf_routing_context_object_from_zend_object(zend_object *obj) {
+    return (sf_routing_context_object *)((char *)obj - XtOffsetOf(sf_routing_context_object, std));
+}
+#define Z_ROUTING_CONTEXT_OBJ_P(zv) sf_routing_context_object_from_zend_object(Z_OBJ_P(zv))
+
 /* ============================================================================
  * Object Create/Free Functions
  * ============================================================================ */
@@ -92,6 +105,9 @@ void sf_route_object_free(zend_object *obj);
 
 zend_object *sf_match_result_object_create(zend_class_entry *ce);
 void sf_match_result_object_free(zend_object *obj);
+
+zend_object *sf_routing_context_object_create(zend_class_entry *ce);
+void sf_routing_context_object_free(zend_object *obj);
 
 /* ============================================================================
  * Module Lifecycle Functions
@@ -151,6 +167,9 @@ PHP_METHOD(Signalforge_Routing_Router, loadCache);
 PHP_METHOD(Signalforge_Routing_Router, setStrictSlashes);
 PHP_METHOD(Signalforge_Routing_Router, dump);
 PHP_METHOD(Signalforge_Routing_Router, getInstance);
+PHP_METHOD(Signalforge_Routing_Router, cli);
+PHP_METHOD(Signalforge_Routing_Router, routeUsing);
+PHP_METHOD(Signalforge_Routing_Router, dispatch);
 
 /* ============================================================================
  * Method Declarations - Route
@@ -191,5 +210,14 @@ PHP_METHOD(Signalforge_Routing_MatchResult, getMiddleware);
 PHP_METHOD(Signalforge_Routing_MatchResult, getRouteName);
 PHP_METHOD(Signalforge_Routing_MatchResult, getError);
 PHP_METHOD(Signalforge_Routing_MatchResult, param);
+
+/* ============================================================================
+ * Method Declarations - RoutingContext
+ * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_RoutingContext, __construct);
+PHP_METHOD(Signalforge_Routing_RoutingContext, getMethod);
+PHP_METHOD(Signalforge_Routing_RoutingContext, getPath);
+PHP_METHOD(Signalforge_Routing_RoutingContext, getDomain);
 
 #endif /* PHP_SIGNALFORGE_ROUTING_H */

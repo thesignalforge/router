@@ -668,6 +668,17 @@ void sf_router_destroy(sf_router *router)
         sf_route_release(router->fallback_route);
     }
 
+    /* Release dispatch context */
+    if (router->dispatch_method) {
+        zend_string_release(router->dispatch_method);
+    }
+    if (router->dispatch_path) {
+        zend_string_release(router->dispatch_path);
+    }
+    if (router->dispatch_domain) {
+        zend_string_release(router->dispatch_domain);
+    }
+
     /* Destroy any remaining group context */
     while (router->current_group) {
         sf_route_group *parent = router->current_group->parent;
@@ -731,6 +742,20 @@ void sf_router_reset(sf_router *router)
         router->fallback_route = NULL;
     }
 
+    /* Release dispatch context */
+    if (router->dispatch_method) {
+        zend_string_release(router->dispatch_method);
+        router->dispatch_method = NULL;
+    }
+    if (router->dispatch_path) {
+        zend_string_release(router->dispatch_path);
+        router->dispatch_path = NULL;
+    }
+    if (router->dispatch_domain) {
+        zend_string_release(router->dispatch_domain);
+        router->dispatch_domain = NULL;
+    }
+
     router->is_immutable = 0;
     router->route_count = 0;
 
@@ -767,6 +792,64 @@ void sf_match_result_destroy(sf_match_result *result)
     }
 
     efree(result);
+}
+
+/* ============================================================================
+ * Memory Management - Routing Context
+ * ============================================================================ */
+
+sf_routing_context *sf_routing_context_create(zend_string *method, zend_string *path, zend_string *domain)
+{
+    sf_routing_context *ctx = ecalloc(1, sizeof(sf_routing_context));
+    ctx->method = zend_string_copy(method);
+    ctx->path = zend_string_copy(path);
+    ctx->domain = domain ? zend_string_copy(domain) : NULL;
+    return ctx;
+}
+
+void sf_routing_context_destroy(sf_routing_context *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->method) {
+        zend_string_release(ctx->method);
+    }
+    if (ctx->path) {
+        zend_string_release(ctx->path);
+    }
+    if (ctx->domain) {
+        zend_string_release(ctx->domain);
+    }
+    efree(ctx);
+}
+
+/* ============================================================================
+ * CLI Path Normalization
+ * ============================================================================ */
+
+zend_string *sf_normalize_cli_path(const char *path, size_t len)
+{
+    smart_str result = {0};
+    size_t i = 0;
+
+    /* Prepend / if not present */
+    if (len == 0 || path[0] != '/') {
+        smart_str_appendc(&result, '/');
+    }
+
+    /* Walk characters: replace : with /, copy everything else */
+    for (i = 0; i < len; i++) {
+        if (path[i] == ':') {
+            smart_str_appendc(&result, '/');
+        } else {
+            smart_str_appendc(&result, path[i]);
+        }
+    }
+
+    smart_str_0(&result);
+    return result.s;
 }
 
 /* ============================================================================
@@ -1152,6 +1235,16 @@ sf_route *sf_router_add_route(sf_router *router, sf_http_method method,
         smart_str_append(&full_uri, uri);
         smart_str_0(&full_uri);
         effective_uri = full_uri.s;
+    }
+
+    /* CLI routes: normalize colon-separated path to slash-separated for trie */
+    zend_string *cli_normalized = NULL;
+    if (method == SF_METHOD_CLI) {
+        cli_normalized = sf_normalize_cli_path(ZSTR_VAL(effective_uri), ZSTR_LEN(effective_uri));
+        if (effective_uri != uri) {
+            zend_string_release(effective_uri);
+        }
+        effective_uri = cli_normalized;
     }
 
     /* Insert into trie */
@@ -1699,11 +1792,21 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
         return result;
     }
 
+    /* CLI routes: normalize colon-separated path to slash-separated for trie lookup */
+    zend_string *cli_normalized = NULL;
+    const char *match_uri = uri;
+    size_t match_uri_len = uri_len;
+    if (method == SF_METHOD_CLI) {
+        cli_normalized = sf_normalize_cli_path(uri, uri_len);
+        match_uri = ZSTR_VAL(cli_normalized);
+        match_uri_len = ZSTR_LEN(cli_normalized);
+    }
+
     /* Read lock: matching is a read-only operation */
     SF_ROUTER_RDLOCK(router);
 
     root = router->method_tries[method];
-    matched_node = sf_trie_match_internal(root, uri, uri_len, result->params, 0);
+    matched_node = sf_trie_match_internal(root, match_uri, match_uri_len, result->params, 0);
 
     /* Most requests should match a defined route */
     if (EXPECTED(matched_node != NULL && matched_node->is_terminal)) {
@@ -1742,6 +1845,10 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
     }
 
     SF_ROUTER_UNLOCK_RD(router);
+
+    if (cli_normalized) {
+        zend_string_release(cli_normalized);
+    }
 
     return result;
 }
@@ -2864,6 +2971,7 @@ sf_http_method sf_method_from_string(const char *method, size_t len)
         if (strncasecmp(method, "GET", 3) == 0) return SF_METHOD_GET;
         if (strncasecmp(method, "PUT", 3) == 0) return SF_METHOD_PUT;
         if (strncasecmp(method, "ANY", 3) == 0) return SF_METHOD_ANY;
+        if (strncasecmp(method, "CLI", 3) == 0) return SF_METHOD_CLI;
     } else if (len == 4) {
         if (strncasecmp(method, "POST", 4) == 0) return SF_METHOD_POST;
         if (strncasecmp(method, "HEAD", 4) == 0) return SF_METHOD_HEAD;
@@ -2885,7 +2993,7 @@ sf_http_method sf_method_from_string(const char *method, size_t len)
 const char *sf_method_to_string(sf_http_method method)
 {
     static const char *methods[] = {
-        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY"
+        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY", "CLI"
     };
 
     if (method >= SF_METHOD_COUNT) {
