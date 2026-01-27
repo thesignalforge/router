@@ -211,14 +211,6 @@ final class Router
     public static function loadCache(string $path): bool {}
 
     /**
-     * Enable/disable strict trailing slash matching.
-     *
-     * @param bool $strict Whether to strictly match trailing slashes
-     * @return void
-     */
-    public static function setStrictSlashes(bool $strict): void {}
-
-    /**
      * Dump the internal trie structure (for debugging).
      *
      * @return void
@@ -257,10 +249,27 @@ final class Router
     public static function routeUsing(mixed $input, callable $resolver): void {}
 
     /**
-     * Dispatch using the context set by routeUsing().
+     * Set a resolver callable for use with dispatch($input).
      *
-     * @return MatchResult The match result
-     * @throws RoutingException If routeUsing() has not been called
+     * The resolver receives the input passed to dispatch() and must return
+     * a RoutingContext instance. Set it once at boot in worker runtimes
+     * (RoadRunner, FrankenPHP), then call dispatch($input) per request.
+     *
+     * @param callable $resolver Callback that receives $input and returns RoutingContext
+     * @return void
      */
-    public static function dispatch(): MatchResult {}
+    public static function resolver(callable $resolver): void {}
+
+    /**
+     * Dispatch using the routing context.
+     *
+     * Without arguments: dispatches using the context set by routeUsing().
+     * With $input: calls the resolver set by resolver() to extract
+     * the routing context, then dispatches.
+     *
+     * @param mixed $input Optional input to pass to the stored resolver
+     * @return MatchResult The match result
+     * @throws RoutingException If no context or resolver is available
+     */
+    public static function dispatch(mixed $input = null): MatchResult {}
 }

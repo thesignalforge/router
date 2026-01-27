@@ -408,6 +408,24 @@ PHP_METHOD(Signalforge_Routing_Router, group)
         }
     }
 
+    if ((val = zend_hash_str_find(Z_ARRVAL_P(attributes), "where", sizeof("where") - 1))) {
+        if (Z_TYPE_P(val) == IS_ARRAY) {
+            /* Store raw {param => pattern} strings; sf_route_apply_group
+             * in routing_trie.c creates the actual constraints */
+            ALLOC_HASHTABLE(group->wheres);
+            zend_hash_init(group->wheres, 4, NULL, ZVAL_PTR_DTOR, 0);
+            zend_string *wkey;
+            zval *wval;
+            ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(val), wkey, wval) {
+                if (wkey && Z_TYPE_P(wval) == IS_STRING) {
+                    zval copy;
+                    ZVAL_STR_COPY(&copy, Z_STR_P(wval));
+                    zend_hash_update(group->wheres, wkey, &copy);
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+    }
+
     /* Enter group context */
     sf_router_begin_group(router, group);
 
@@ -658,20 +676,6 @@ PHP_METHOD(Signalforge_Routing_Router, loadCache)
     RETURN_TRUE;
 }
 
-PHP_METHOD(Signalforge_Routing_Router, setStrictSlashes)
-{
-    zend_bool strict;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_BOOL(strict)
-    ZEND_PARSE_PARAMETERS_END();
-
-    sf_router *router = sf_get_global_router();
-    router->trailing_slash_strict = strict;
-
-    RETURN_NULL();
-}
-
 PHP_METHOD(Signalforge_Routing_Router, dump)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -704,18 +708,22 @@ PHP_METHOD(Signalforge_Routing_Router, cli)
     sf_router_register_method(INTERNAL_FUNCTION_PARAM_PASSTHRU, SF_METHOD_CLI);
 }
 
-PHP_METHOD(Signalforge_Routing_Router, routeUsing)
+/* Helper: call a resolver callable with input, store the resulting context on the router.
+ * Returns SUCCESS or FAILURE (with exception set). */
+static int sf_call_resolver_and_store(sf_router *router, zval *resolver, zval *input)
 {
-    zval *input;
     zend_fcall_info fci;
     zend_fcall_info_cache fcc;
+    char *error = NULL;
 
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ZVAL(input)
-        Z_PARAM_FUNC(fci, fcc)
-    ZEND_PARSE_PARAMETERS_END();
+    if (zend_fcall_info_init(resolver, 0, &fci, &fcc, NULL, &error) != SUCCESS) {
+        if (error) efree(error);
+        zend_throw_exception(sf_routing_exception_ce,
+            "Failed to initialize routing resolver", 0);
+        return FAILURE;
+    }
+    if (error) efree(error);
 
-    /* Call the resolver with $input as argument */
     zval retval;
     zval args[1];
     ZVAL_COPY_VALUE(&args[0], input);
@@ -727,24 +735,21 @@ PHP_METHOD(Signalforge_Routing_Router, routeUsing)
     if (zend_call_function(&fci, &fcc) != SUCCESS) {
         zend_throw_exception(sf_routing_exception_ce,
             "Failed to call routing resolver", 0);
-        RETURN_THROWS();
+        return FAILURE;
     }
 
-    /* Check for exception thrown inside resolver */
     if (EG(exception)) {
         zval_ptr_dtor(&retval);
-        RETURN_THROWS();
+        return FAILURE;
     }
 
-    /* Validate return type is RoutingContext */
     if (Z_TYPE(retval) != IS_OBJECT || !instanceof_function(Z_OBJCE(retval), sf_routing_context_ce)) {
         zval_ptr_dtor(&retval);
         zend_throw_exception(sf_routing_exception_ce,
             "Resolver must return a RoutingContext instance", 0);
-        RETURN_THROWS();
+        return FAILURE;
     }
 
-    /* Extract context from the returned object */
     sf_routing_context_object *ctx_obj = sf_routing_context_object_from_zend_object(Z_OBJ(retval));
     sf_routing_context *ctx = ctx_obj->context;
 
@@ -752,29 +757,57 @@ PHP_METHOD(Signalforge_Routing_Router, routeUsing)
         zval_ptr_dtor(&retval);
         zend_throw_exception(sf_routing_exception_ce,
             "RoutingContext has invalid state", 0);
-        RETURN_THROWS();
+        return FAILURE;
     }
 
-    /* Store dispatch context in the router */
-    sf_router *router = sf_get_global_router();
-
-    if (router->dispatch_method) {
-        zend_string_release(router->dispatch_method);
-    }
-    if (router->dispatch_path) {
-        zend_string_release(router->dispatch_path);
-    }
-    if (router->dispatch_domain) {
-        zend_string_release(router->dispatch_domain);
-    }
+    if (router->dispatch_method) zend_string_release(router->dispatch_method);
+    if (router->dispatch_path) zend_string_release(router->dispatch_path);
+    if (router->dispatch_domain) zend_string_release(router->dispatch_domain);
 
     router->dispatch_method = zend_string_copy(ctx->method);
     router->dispatch_path = zend_string_copy(ctx->path);
     router->dispatch_domain = ctx->domain ? zend_string_copy(ctx->domain) : NULL;
 
     zval_ptr_dtor(&retval);
+    return SUCCESS;
+}
+
+PHP_METHOD(Signalforge_Routing_Router, routeUsing)
+{
+    zval *input;
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_ZVAL(input)
+        Z_PARAM_FUNC(fci, fcc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_router *router = sf_get_global_router();
+
+    if (sf_call_resolver_and_store(router, &fci.function_name, input) != SUCCESS) {
+        RETURN_THROWS();
+    }
 
     RETURN_NULL();
+}
+
+PHP_METHOD(Signalforge_Routing_Router, resolver)
+{
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_FUNC(fci, fcc)
+    ZEND_PARSE_PARAMETERS_END();
+
+    sf_router *router = sf_get_global_router();
+
+    if (!Z_ISUNDEF(router->dispatch_resolver)) {
+        zval_ptr_dtor(&router->dispatch_resolver);
+    }
+
+    ZVAL_COPY(&router->dispatch_resolver, &fci.function_name);
 }
 
 /* Forward declarations for proxy helpers used in dispatch() */
@@ -787,13 +820,36 @@ static sf_proxy_response *sf_proxy_call_on_response(sf_proxy_options *opts, sf_p
 
 PHP_METHOD(Signalforge_Routing_Router, dispatch)
 {
-    ZEND_PARSE_PARAMETERS_NONE();
+    zval *input = NULL;
+
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(input)
+    ZEND_PARSE_PARAMETERS_END();
 
     sf_router *router = sf_get_global_router();
 
+    /* If input provided, resolve via stored resolver */
+    if (input && Z_TYPE_P(input) != IS_NULL) {
+        if (Z_ISUNDEF(router->dispatch_resolver)) {
+            zend_throw_exception(sf_routing_exception_ce,
+                "No resolver set. Call Router::resolver() before Router::dispatch($input)", 0);
+            RETURN_THROWS();
+        }
+        /* Copy the resolver before calling — the callback could modify/free
+         * the stored resolver (e.g., via Router::flush() or Router::resolver()) */
+        zval resolver_copy;
+        ZVAL_COPY(&resolver_copy, &router->dispatch_resolver);
+        int resolve_result = sf_call_resolver_and_store(router, &resolver_copy, input);
+        zval_ptr_dtor(&resolver_copy);
+        if (resolve_result != SUCCESS) {
+            RETURN_THROWS();
+        }
+    }
+
     if (!router->dispatch_method) {
         zend_throw_exception(sf_routing_exception_ce,
-            "No routing context set. Call Router::routeUsing() before Router::dispatch()", 0);
+            "No routing context set. Call Router::routeUsing() or Router::resolver() before Router::dispatch()", 0);
         RETURN_THROWS();
     }
 
@@ -2285,6 +2341,16 @@ static sf_proxy_request *sf_proxy_build_request_from_sapi(zend_string *url, sf_h
 
 static sf_proxy_response *sf_proxy_execute(sf_proxy_request *req, sf_proxy_options *opts)
 {
+    /* Validate URL scheme — defense-in-depth against onRequest SSRF bypass */
+    const char *url_check = ZSTR_VAL(req->url);
+    if (ZSTR_LEN(req->url) < 8 ||
+        (strncasecmp(url_check, "http://", 7) != 0 &&
+         strncasecmp(url_check, "https://", 8) != 0)) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Proxy request URL must use http:// or https:// scheme", 0);
+        return NULL;
+    }
+
     zval http_opts;
     array_init(&http_opts);
 
@@ -2627,10 +2693,6 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_loadCache, 0, 1, _IS_BOOL
     ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_setStrictSlashes, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, strict, _IS_BOOL, 0)
-ZEND_END_ARG_INFO()
-
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_dump, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -2647,7 +2709,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_routeUsing, 0, 2, IS_VOID
     ZEND_ARG_TYPE_INFO(0, resolver, IS_CALLABLE, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_resolver, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, resolver, IS_CALLABLE, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_dispatch, 0, 0, Signalforge\\Routing\\MatchResult, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, input, IS_MIXED, 1, "null")
 ZEND_END_ARG_INFO()
 
 /* RoutingContext arg info */
@@ -2885,11 +2952,11 @@ static const zend_function_entry sf_router_methods[] = {
     PHP_ME(Signalforge_Routing_Router, flush, arginfo_router_flush, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, cache, arginfo_router_cache, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, loadCache, arginfo_router_loadCache, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, setStrictSlashes, arginfo_router_setStrictSlashes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, dump, arginfo_router_dump, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, getInstance, arginfo_router_getInstance, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, cli, arginfo_router_cli, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, routeUsing, arginfo_router_routeUsing, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, resolver, arginfo_router_resolver, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(Signalforge_Routing_Router, dispatch, arginfo_router_dispatch, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
@@ -2981,17 +3048,7 @@ static const zend_function_entry sf_routing_context_methods[] = {
 
 static void php_signalforge_routing_globals_ctor(zend_signalforge_routing_globals *globals)
 {
-    globals->last_error = SF_OK;
-    globals->last_error_msg = NULL;
     globals->global_router = NULL;
-}
-
-static void php_signalforge_routing_globals_dtor(zend_signalforge_routing_globals *globals)
-{
-    if (globals->last_error_msg) {
-        efree(globals->last_error_msg);
-        globals->last_error_msg = NULL;
-    }
 }
 
 PHP_MINIT_FUNCTION(signalforge_routing)
@@ -2999,7 +3056,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     zend_class_entry ce;
 
     /* Initialize globals */
-    ZEND_INIT_MODULE_GLOBALS(signalforge_routing, php_signalforge_routing_globals_ctor, php_signalforge_routing_globals_dtor);
+    ZEND_INIT_MODULE_GLOBALS(signalforge_routing, php_signalforge_routing_globals_ctor, NULL);
 
     /* Register Router class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "Router", sf_router_methods);
@@ -3010,6 +3067,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_router_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_router_object_handlers.offset = XtOffsetOf(sf_router_object, std);
     sf_router_object_handlers.free_obj = sf_router_object_free;
+    sf_router_object_handlers.clone_obj = NULL;
 
     /* Register Route class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "Route", sf_route_methods);
@@ -3020,6 +3078,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_route_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_route_object_handlers.offset = XtOffsetOf(sf_route_object, std);
     sf_route_object_handlers.free_obj = sf_route_object_free;
+    sf_route_object_handlers.clone_obj = NULL;
 
     /* Register MatchResult class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "MatchResult", sf_match_result_methods);
@@ -3030,6 +3089,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_match_result_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_match_result_object_handlers.offset = XtOffsetOf(sf_match_result_object, std);
     sf_match_result_object_handlers.free_obj = sf_match_result_object_free;
+    sf_match_result_object_handlers.clone_obj = NULL;
 
     /* Register RoutingContext class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "RoutingContext", sf_routing_context_methods);
@@ -3040,6 +3100,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
     memcpy(&sf_routing_context_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     sf_routing_context_object_handlers.offset = XtOffsetOf(sf_routing_context_object, std);
     sf_routing_context_object_handlers.free_obj = sf_routing_context_object_free;
+    sf_routing_context_object_handlers.clone_obj = NULL;
 
     /* Register ProxyRequest class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "ProxyRequest", sf_proxy_request_methods);
@@ -3083,8 +3144,6 @@ PHP_RINIT_FUNCTION(signalforge_routing)
 
     /* Create fresh router for each request */
     SF_G(global_router) = NULL;
-    SF_G(last_error) = SF_OK;
-    SF_G(last_error_msg) = NULL;
 
     return SUCCESS;
 }
@@ -3095,11 +3154,6 @@ PHP_RSHUTDOWN_FUNCTION(signalforge_routing)
     if (SF_G(global_router)) {
         sf_router_destroy(SF_G(global_router));
         SF_G(global_router) = NULL;
-    }
-
-    if (SF_G(last_error_msg)) {
-        efree(SF_G(last_error_msg));
-        SF_G(last_error_msg) = NULL;
     }
 
     return SUCCESS;

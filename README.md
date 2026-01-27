@@ -31,6 +31,7 @@ A PHP routing extension written in C. It uses a compressed radix trie internally
   - [ProxyResponse](#proxyresponse)
   - [Proxy Security](#proxy-security)
 - [Route Caching](#route-caching)
+- [Worker Runtimes](#worker-runtimes)
 - [How It's Built](#how-its-built)
   - [The Radix Trie](#the-radix-trie)
   - [Why It Gets Faster with More Routes](#why-it-gets-faster-with-more-routes)
@@ -633,7 +634,110 @@ Router::loadCache('/var/cache/routes.bin');
 
 Closures can't be serialized. If you want caching, use array callables: `[Controller::class, 'method']`.
 
-`Router::flush()` clears all routes, named routes, groups, dispatch context, and the fallback.
+`Router::flush()` clears all routes, named routes, groups, dispatch context, the stored resolver, and the fallback.
+
+---
+
+## Worker Runtimes
+
+For RoadRunner, FrankenPHP, and other long-running PHP runtimes, RINIT/RSHUTDOWN fire once per worker lifetime instead of per request. Routes and the resolver are registered once at boot; only the request changes per iteration.
+
+The `Router::resolver()` + `Router::dispatch($input)` pattern is designed for this. Set the resolver once, then call `dispatch($input)` in the request loop. The existing `routeUsing($input, $resolver)` + `dispatch()` pattern still works — this is an alternative, not a replacement.
+
+### RoadRunner
+
+```php
+<?php
+// worker.php
+
+use Signalforge\Routing\{Router, RoutingContext};
+use Spiral\RoadRunner\Http\HttpWorker;
+use Spiral\RoadRunner\Worker;
+
+// Boot — runs once per worker
+require __DIR__ . '/routes.php';
+
+Router::resolver(function (\Nyholm\Psr7\ServerRequest $request): RoutingContext {
+    $uri = $request->getUri();
+    return new RoutingContext(
+        $request->getMethod(),
+        $uri->getPath(),
+        $uri->getHost()
+    );
+});
+
+$worker = new HttpWorker(Worker::create());
+
+// Request loop — runs per request
+while ($req = $worker->waitRequest()) {
+    $result = Router::dispatch($req);
+
+    if (!$result->matched()) {
+        $worker->respond(404, 'Not Found');
+        continue;
+    }
+
+    $handler = $result->getHandler();
+    $params  = $result->getParams();
+
+    if (is_array($handler)) {
+        [$class, $method] = $handler;
+        $response = (new $class())->$method(...array_values($params));
+    } else {
+        $response = $handler(...array_values($params));
+    }
+
+    $worker->respond(200, (string) $response);
+}
+```
+
+### FrankenPHP
+
+```php
+<?php
+// worker.php
+
+use Signalforge\Routing\{Router, RoutingContext};
+
+// Boot — runs once per worker
+require __DIR__ . '/routes.php';
+
+Router::resolver(function (array $server): RoutingContext {
+    return new RoutingContext(
+        $server['REQUEST_METHOD'],
+        parse_url($server['REQUEST_URI'], PHP_URL_PATH),
+        $server['HTTP_HOST'] ?? null
+    );
+});
+
+// Request loop — FrankenPHP calls this per request
+$handler = static function (): void {
+    $result = Router::dispatch($_SERVER);
+
+    if (!$result->matched()) {
+        http_response_code(404);
+        echo 'Not Found';
+        return;
+    }
+
+    $handler = $result->getHandler();
+    $params  = $result->getParams();
+
+    if (is_array($handler)) {
+        [$class, $method] = $handler;
+        echo (new $class())->$method(...array_values($params));
+    } else {
+        echo $handler(...array_values($params));
+    }
+};
+
+// FrankenPHP worker mode
+do {
+    $handler();
+} while (\frankenphp_handle_request($handler));
+```
+
+The key difference from the standard `routeUsing()` pattern: with `resolver()`, the callable is stored once and reused. With `routeUsing()`, you pass both the input and the resolver on every call, which is fine for traditional PHP-FPM but redundant in a worker loop where the resolver never changes.
 
 ---
 
@@ -753,7 +857,8 @@ All methods are static.
 | `cli($command, $handler)` | `Route` | Register CLI command |
 | `match($method, $uri, $domain?)` | `MatchResult` | Match a request |
 | `routeUsing($input, $resolver)` | `void` | Bind input + resolver for dispatch |
-| `dispatch()` | `MatchResult` | Dispatch using bound context |
+| `resolver($resolver)` | `void` | Store resolver for dispatch($input) |
+| `dispatch($input?)` | `MatchResult` | Dispatch using bound context or stored resolver |
 | `group($attrs, $callback)` | `void` | Group routes with shared config |
 | `fallback($handler)` | `Route` | Set fallback handler |
 | `url($name, $params?)` | `?string` | Generate URL from named route |
