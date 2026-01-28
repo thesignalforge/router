@@ -811,8 +811,8 @@ apt install php-dev libpcre2-dev
 ### Build from Source
 
 ```bash
-git clone https://github.com/niccolosanaworkinprogress/signalforge-router.git
-cd signalforge-router
+git clone git@github.com:thesignalforge/router.git
+cd router
 
 phpize
 ./configure --enable-signalforge-routing

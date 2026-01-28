@@ -14,7 +14,6 @@
 #include "routing_trie.h"
 #include "ext/spl/spl_exceptions.h"
 #include "zend_smart_str.h"
-#include "ext/standard/php_smart_string.h"
 #include "main/SAPI.h"
 #include "main/php_streams.h"
 #include "main/php_globals.h"
