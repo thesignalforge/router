@@ -1,5 +1,8 @@
 # Signalforge Router
 
+[![PHP 8.3+](https://img.shields.io/badge/PHP-8.3%2B-blue.svg)](https://php.net)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A PHP routing extension written in C. It uses a compressed radix trie internally so route matching is O(k) where k is the number of URI segments, not the number of registered routes. It handles HTTP routing, CLI command dispatch, and reverse proxying to upstream servers.
 
 ## Table of Contents
