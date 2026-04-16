@@ -11,10 +11,13 @@
 #endif
 
 #include "php.h"
+#include "php_ini.h"
 #include "routing_trie.h"
+#include "signalforge_routing.h"
 #include "zend_exceptions.h"
 #include "zend_smart_str.h"
 #include <string.h>
+#include <sodium.h>
 
 /* File locking constants for HIGH-01 fix */
 #ifdef PHP_WIN32
@@ -31,6 +34,78 @@
 #else
 # include <sys/file.h>
 #endif
+
+/* ============================================================================
+ * Authenticated route cache
+ *
+ * Cache files are MAC-protected with a libsodium crypto_auth HMAC
+ * (HMAC-SHA512/256, 32-byte key, 32-byte tag). The key comes from the INI
+ * setting `signalforge_routing.cache_key` as a 64-char hex string.
+ *
+ * The original SFRC format was unauthenticated: anyone who could write the
+ * cache file could inject arbitrary route handlers (array callables are
+ * deserialized into live zvals) and achieve RCE on the next request. The new
+ * SFR1 format binds the payload to a shared secret so that a tampered file
+ * is rejected before any attacker-controlled bytes reach the deserializer.
+ *
+ * File layout:
+ *   [ 4 bytes magic "SFR1" | 4 bytes version uint32 BE | N bytes payload |
+ *     32 bytes HMAC over magic+version+payload ]
+ *
+ * The magic deliberately differs from the pre-fix "SFRC" magic so old
+ * unauthenticated caches fail closed rather than loading silently.
+ * ============================================================================ */
+
+#define SF_CACHE_AUTH_MAGIC     "SFR1"
+#define SF_CACHE_AUTH_MAGIC_LEN 4
+#define SF_CACHE_AUTH_VERSION   1u
+#define SF_CACHE_AUTH_HDR_LEN   (SF_CACHE_AUTH_MAGIC_LEN + 4)     /* magic + version */
+#define SF_CACHE_AUTH_MAC_LEN   crypto_auth_BYTES                 /* 32 */
+#define SF_CACHE_AUTH_KEY_LEN   crypto_auth_KEYBYTES              /* 32 */
+#define SF_CACHE_AUTH_KEY_HEX   (SF_CACHE_AUTH_KEY_LEN * 2)       /* 64 hex chars */
+
+/*
+ * Resolve the HMAC key for cache authentication into `out_key`.
+ *
+ * Returns 1 on success with out_key populated; 0 on failure (missing/invalid
+ * INI setting). On success the caller MUST sodium_memzero(out_key, ...) once
+ * done to avoid leaving keying material in the request heap.
+ */
+static int sf_cache_resolve_key(unsigned char out_key[SF_CACHE_AUTH_KEY_LEN])
+{
+    const char *hex = INI_STR("signalforge_routing.cache_key");
+    if (!hex || !*hex) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - "
+            "signalforge_routing.cache_key is not set. Generate a 32-byte hex key, "
+            "e.g. `php -r \"echo bin2hex(random_bytes(32));\"`, and put it in php.ini "
+            "(signalforge_routing.cache_key=...).");
+        return 0;
+    }
+
+    size_t hex_len = strlen(hex);
+    if (hex_len != SF_CACHE_AUTH_KEY_HEX) {
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - "
+            "signalforge_routing.cache_key must be exactly %d hex characters (got %zu).",
+            SF_CACHE_AUTH_KEY_HEX, hex_len);
+        return 0;
+    }
+
+    size_t bin_len = 0;
+    if (sodium_hex2bin(out_key, SF_CACHE_AUTH_KEY_LEN,
+                       hex, hex_len,
+                       NULL, &bin_len, NULL) != 0
+        || bin_len != SF_CACHE_AUTH_KEY_LEN) {
+        sodium_memzero(out_key, SF_CACHE_AUTH_KEY_LEN);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - "
+            "signalforge_routing.cache_key is not valid hex.");
+        return 0;
+    }
+
+    return 1;
+}
 
 /* ============================================================================
  * Memory Management - Trie Nodes
@@ -1610,6 +1685,22 @@ void sf_route_set_domain(sf_route *route, zend_string *domain)
             NULL
         );
 
+        /* Fail loudly on invalid regex. Silently leaving domain_regex NULL
+         * caused a fallback to literal string comparison — which meant a
+         * bogus pattern silently never matched anything in production. */
+        if (!route->domain_regex) {
+            PCRE2_UCHAR errbuf[256];
+            pcre2_get_error_message(errcode, errbuf, sizeof(errbuf));
+            zend_throw_exception_ex(sf_routing_exception_ce, 0,
+                "Invalid domain pattern '%s': PCRE2 compile failed at offset %zu: %s",
+                ZSTR_VAL(domain), (size_t)erroffset, (const char *)errbuf);
+            smart_str_free(&pattern);
+            /* Leave route->domain set so __destruct can clean up, but without
+             * regex the match will never succeed — which is fine, the caller
+             * got a throwable exception. */
+            return;
+        }
+
         smart_str_free(&pattern);
     }
 }
@@ -1942,7 +2033,11 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
     /* Get method-specific trie - invalid method is extremely rare */
     if (UNEXPECTED(method >= SF_METHOD_COUNT)) {
         result->matched = 0;
-        result->error = zend_string_init("Invalid HTTP method", sizeof("Invalid HTTP method") - 1, 0);
+        /* SF_METHOD_UNKNOWN (sentinel from sf_method_from_string on an
+         * unrecognized method name) — caller should render 501 Not Implemented. */
+        result->error = zend_string_init(
+            "Unknown HTTP method",
+            sizeof("Unknown HTTP method") - 1, 0);
         return result;
     }
 
@@ -1988,8 +2083,42 @@ sf_match_result *sf_trie_match(sf_router *router, sf_http_method method,
                 sizeof("Parameter constraint validation failed") - 1, 0);
         }
     } else {
-        /* Check fallback route */
-        if (router->fallback_route) {
+        /* Before giving up, probe the OTHER method tries with the same URI.
+         * If any of them produce a terminal node, the path exists but the
+         * method is wrong — that's HTTP 405, not 404. Collect every allowed
+         * method into a bitmask so the dispatcher can render `Allow:` header. */
+        uint16_t allowed_mask = 0;
+        HashTable *probe_params = NULL;
+        ALLOC_HASHTABLE(probe_params);
+        zend_hash_init(probe_params, SF_PARAMS_INITIAL_SIZE, NULL, ZVAL_PTR_DTOR, 0);
+
+        for (int m = 0; m < SF_METHOD_COUNT; m++) {
+            if (m == (int)method) continue;
+            if (m == SF_METHOD_ANY) continue;
+            if (!router->method_tries[m]) continue;
+
+            zend_hash_clean(probe_params);
+            sf_trie_node *probe = sf_trie_match_internal(
+                router->method_tries[m], match_uri, match_uri_len, probe_params, 0);
+
+            if (probe && probe->is_terminal &&
+                sf_validate_params(probe->route, probe_params)) {
+                allowed_mask |= (uint16_t)(1u << m);
+            }
+        }
+
+        zend_hash_destroy(probe_params);
+        FREE_HASHTABLE(probe_params);
+
+        if (allowed_mask != 0) {
+            /* Path exists, method doesn't — 405. */
+            result->matched = 0;
+            result->method_not_allowed = 1;
+            result->allowed_methods_mask = allowed_mask;
+            result->error = zend_string_init("Method not allowed",
+                sizeof("Method not allowed") - 1, 0);
+        } else if (router->fallback_route) {
+            /* Check fallback route */
             result->matched = 1;
             result->route = router->fallback_route;
             sf_route_addref(result->route);
@@ -2213,10 +2342,36 @@ zend_string *sf_router_url(sf_router *router, zend_string *name, HashTable *para
             zval *param_val = params ? zend_hash_str_find(params, param_start, param_len) : NULL;
 
             if (param_val) {
+                /* Pre-check value size BEFORE appending — a single param value
+                 * larger than SF_MAX_URI_LENGTH would fly past the post-append
+                 * length check and cause memory exhaustion. (audit M-R-1) */
+                zend_string *str_val = NULL;
+                size_t value_len;
+
+                if (Z_TYPE_P(param_val) == IS_STRING) {
+                    value_len = ZSTR_LEN(Z_STR_P(param_val));
+                } else {
+                    str_val = zval_get_string(param_val);
+                    value_len = ZSTR_LEN(str_val);
+                }
+
+                size_t current_url_len = url.s ? ZSTR_LEN(url.s) : 0;
+                if (value_len > SF_MAX_URI_LENGTH ||
+                    current_url_len + value_len > SF_MAX_URI_LENGTH)
+                {
+                    if (str_val) zend_string_release(str_val);
+                    smart_str_free(&url);
+                    SF_ROUTER_UNLOCK_RD(router);
+                    php_error_docref(NULL, E_WARNING,
+                        "Signalforge\\Routing: Parameter '%.*s' value is too large "
+                        "(would exceed URL limit of %d bytes)",
+                        (int)param_len, param_start, SF_MAX_URI_LENGTH);
+                    return NULL;
+                }
+
                 if (Z_TYPE_P(param_val) == IS_STRING) {
                     smart_str_append(&url, Z_STR_P(param_val));
                 } else {
-                    zend_string *str_val = zval_get_string(param_val);
                     smart_str_append(&url, str_val);
                     zend_string_release(str_val);
                 }
@@ -2365,7 +2520,9 @@ typedef struct {
     char *data;
     size_t len;
     size_t capacity;
-    zend_bool failed;  /* Track allocation failures */
+    zend_bool failed;             /* Track allocation failures */
+    zend_bool closure_encountered;/* Route with non-serializable closure handler */
+    zend_string *closure_route;   /* URI of the offending route, for error message */
 } sf_write_buffer;
 
 /* Maximum buffer size to prevent excessive memory allocation (64MB) */
@@ -2380,6 +2537,8 @@ static void sf_buf_init(sf_write_buffer *buf, size_t initial_capacity)
     buf->len = 0;
     buf->capacity = initial_capacity;
     buf->failed = 0;
+    buf->closure_encountered = 0;
+    buf->closure_route = NULL;
 }
 
 static void sf_buf_ensure(sf_write_buffer *buf, size_t need)
@@ -2539,10 +2698,26 @@ static void sf_serialize_route_bin(sf_write_buffer *buf, sf_route *route)
             sf_buf_write_string(buf, Z_STR_P(cls));
             sf_buf_write_string(buf, Z_STR_P(mtd));
         } else {
-            sf_buf_write_u8(buf, 0); /* Cannot serialize */
+            /* Malformed callable array — flag as closure-like (non-cacheable). */
+            sf_buf_write_u8(buf, 0);
+            if (!buf->closure_encountered) {
+                buf->closure_encountered = 1;
+                if (route->uri) {
+                    buf->closure_route = route->uri;
+                }
+            }
         }
     } else {
-        sf_buf_write_u8(buf, 0); /* No serializable handler (closure) */
+        /* Closure or other non-serializable handler. Record the first one so
+         * the caller can throw a loud exception — silently dropping the route
+         * would cause the cached router to 404 in production. */
+        sf_buf_write_u8(buf, 0);
+        if (!buf->closure_encountered) {
+            buf->closure_encountered = 1;
+            if (route->uri) {
+                buf->closure_route = route->uri;
+            }
+        }
     }
 
     /* Method */
@@ -2888,7 +3063,15 @@ static sf_trie_node *sf_deserialize_node_bin_internal(sf_read_buffer *buf, int d
                 child->depth = node->depth + 1;
                 zval zv;
                 ZVAL_PTR(&zv, child);
-                zend_hash_add(node->static_children, key, &zv);
+                /* zend_hash_add returns NULL on duplicate key — it does NOT
+                 * replace. If a tampered/corrupt cache contains two siblings
+                 * with the same segment name, the second child is orphaned
+                 * from the hashtable's destructor set and leaks on cleanup.
+                 * Detected by cache-deserializer fuzzer; defense in depth
+                 * since SFR1 HMAC gates untrusted input. (fuzz finding 01) */
+                if (zend_hash_add(node->static_children, key, &zv) == NULL) {
+                    sf_trie_node_destroy_recursive(child);
+                }
             } else if (child) {
                 /* Key failed but child succeeded - free the orphaned child */
                 sf_trie_node_destroy_recursive(child);
@@ -2991,6 +3174,20 @@ zend_string *sf_router_serialize(sf_router *router)
         return NULL;
     }
 
+    /* Refuse to ship a cache that silently drops closure-based routes.
+     * Shipping a partial cache would cause 404s in production and the silent
+     * failure mode was an observed bug — fail loudly at cache-build time. */
+    if (buf.closure_encountered) {
+        const char *uri = buf.closure_route ? ZSTR_VAL(buf.closure_route) : "(unknown)";
+        efree(buf.data);
+        zend_throw_exception_ex(sf_routing_exception_ce, 0,
+            "Route '%s' has a closure handler which cannot be cached; "
+            "this route would be lost on cache load. "
+            "Use [Class::class, 'method'] form for cacheable routes.",
+            uri);
+        return NULL;
+    }
+
     /* Create zend_string from buffer */
     result = zend_string_init(buf.data, buf.len, 0);
     efree(buf.data);
@@ -3059,12 +3256,70 @@ sf_router *sf_router_unserialize(const char *data, size_t len)
     return router;
 }
 
+/*
+ * Persist the router to disk in the authenticated SFR1 format.
+ *
+ * Flow:
+ *   1. Refuse without a configured HMAC key - better to fail loudly at deploy
+ *      time than ship a cache an attacker could forge.
+ *   2. Serialize the trie into the same payload the old format used.
+ *   3. Write [magic | version | payload] and compute a crypto_auth tag over
+ *      exactly those bytes.
+ *   4. Append the 32-byte tag so the file verifies end-to-end on load.
+ *
+ * The key material lives on the stack and is explicitly zeroed before return
+ * to reduce the window an attacker with memory-read capability has to scrape
+ * it from a long-lived worker process.
+ */
 zend_bool sf_router_cache_to_file(sf_router *router, const char *path)
 {
-    zend_string *serialized = sf_router_serialize(router);
-    if (!serialized) {
+    unsigned char key[SF_CACHE_AUTH_KEY_LEN];
+    if (!sf_cache_resolve_key(key)) {
         return 0;
     }
+
+    zend_string *serialized = sf_router_serialize(router);
+    if (!serialized) {
+        sodium_memzero(key, sizeof(key));
+        return 0;
+    }
+
+    /* Build the authenticated image: header || payload || mac.
+     * We compute the MAC over header||payload, so tampering with either part
+     * (including the version byte or magic) invalidates the file. */
+    size_t payload_len = ZSTR_LEN(serialized);
+    if (payload_len > SIZE_MAX - SF_CACHE_AUTH_HDR_LEN - SF_CACHE_AUTH_MAC_LEN) {
+        zend_string_release(serialized);
+        sodium_memzero(key, sizeof(key));
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache payload too large");
+        return 0;
+    }
+    size_t total_len = SF_CACHE_AUTH_HDR_LEN + payload_len + SF_CACHE_AUTH_MAC_LEN;
+
+    unsigned char *image = emalloc(total_len);
+    memcpy(image, SF_CACHE_AUTH_MAGIC, SF_CACHE_AUTH_MAGIC_LEN);
+    uint32_t version = SF_CACHE_AUTH_VERSION;
+    image[4] = (unsigned char)((version >> 24) & 0xFF);
+    image[5] = (unsigned char)((version >> 16) & 0xFF);
+    image[6] = (unsigned char)((version >> 8)  & 0xFF);
+    image[7] = (unsigned char)(version & 0xFF);
+    memcpy(image + SF_CACHE_AUTH_HDR_LEN, ZSTR_VAL(serialized), payload_len);
+
+    if (crypto_auth(image + SF_CACHE_AUTH_HDR_LEN + payload_len,
+                    image, SF_CACHE_AUTH_HDR_LEN + payload_len,
+                    key) != 0) {
+        sodium_memzero(key, sizeof(key));
+        sodium_memzero(image, total_len);
+        efree(image);
+        zend_string_release(serialized);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache HMAC computation failed");
+        return 0;
+    }
+
+    sodium_memzero(key, sizeof(key));
+    zend_string_release(serialized);
 
     php_stream *stream = php_stream_open_wrapper(
         (char *)path, "wb",
@@ -3073,7 +3328,7 @@ zend_bool sf_router_cache_to_file(sf_router *router, const char *path)
     );
 
     if (!stream) {
-        zend_string_release(serialized);
+        efree(image);
         return 0;
     }
 
@@ -3083,19 +3338,37 @@ zend_bool sf_router_cache_to_file(sf_router *router, const char *path)
         /* Lock failed - proceed without locking (best effort) */
     }
 
-    size_t written = php_stream_write(stream, ZSTR_VAL(serialized), ZSTR_LEN(serialized));
+    size_t written = php_stream_write(stream, (const char *)image, total_len);
 
     /* Release lock and close stream */
     php_stream_lock(stream, LOCK_UN);
     php_stream_close(stream);
-    size_t serialized_len = ZSTR_LEN(serialized);
-    zend_string_release(serialized);
 
-    return written == serialized_len;
+    efree(image);
+
+    return written == total_len;
 }
 
+/*
+ * Load a router from an authenticated SFR1 cache file.
+ *
+ * Rejection policy (fail-closed, in order):
+ *   - Missing or malformed HMAC key -> refuse and warn.
+ *   - File shorter than [magic|version|mac] -> refuse.
+ *   - Magic mismatch (e.g. old "SFRC" caches) -> refuse with a clear hint.
+ *   - Version mismatch -> refuse.
+ *   - MAC mismatch (verified constant-time) -> refuse without touching the
+ *     payload. This is the key property: we never feed attacker-controlled
+ *     bytes into sf_router_unserialize unless the MAC matches a secret only
+ *     the server holds.
+ */
 sf_router *sf_router_load_from_file(const char *path)
 {
+    unsigned char key[SF_CACHE_AUTH_KEY_LEN];
+    if (!sf_cache_resolve_key(key)) {
+        return NULL;
+    }
+
     php_stream *stream = php_stream_open_wrapper(
         (char *)path, "rb",
         REPORT_ERRORS | STREAM_MUST_SEEK,
@@ -3103,6 +3376,7 @@ sf_router *sf_router_load_from_file(const char *path)
     );
 
     if (!stream) {
+        sodium_memzero(key, sizeof(key));
         return NULL;
     }
 
@@ -3119,10 +3393,78 @@ sf_router *sf_router_load_from_file(const char *path)
     php_stream_close(stream);
 
     if (!contents) {
+        sodium_memzero(key, sizeof(key));
         return NULL;
     }
 
-    sf_router *router = sf_router_unserialize(ZSTR_VAL(contents), ZSTR_LEN(contents));
+    size_t len = ZSTR_LEN(contents);
+    const unsigned char *buf = (const unsigned char *)ZSTR_VAL(contents);
+
+    if (len < SF_CACHE_AUTH_HDR_LEN + SF_CACHE_AUTH_MAC_LEN) {
+        sodium_memzero(key, sizeof(key));
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - file truncated");
+        return NULL;
+    }
+
+    if (memcmp(buf, SF_CACHE_AUTH_MAGIC, SF_CACHE_AUTH_MAGIC_LEN) != 0) {
+        sodium_memzero(key, sizeof(key));
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - bad magic "
+            "(expected \"SFR1\"; legacy unauthenticated caches are no longer accepted). "
+            "Regenerate the cache after setting signalforge_routing.cache_key.");
+        return NULL;
+    }
+
+    uint32_t version = ((uint32_t)buf[4] << 24)
+                     | ((uint32_t)buf[5] << 16)
+                     | ((uint32_t)buf[6] << 8)
+                     |  (uint32_t)buf[7];
+    if (version != SF_CACHE_AUTH_VERSION) {
+        sodium_memzero(key, sizeof(key));
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - version %u not supported",
+            (unsigned)version);
+        return NULL;
+    }
+
+    size_t mac_offset = len - SF_CACHE_AUTH_MAC_LEN;
+    size_t auth_len   = mac_offset; /* magic + version + payload */
+
+    unsigned char computed_mac[SF_CACHE_AUTH_MAC_LEN];
+    if (crypto_auth(computed_mac, buf, auth_len, key) != 0) {
+        sodium_memzero(key, sizeof(key));
+        sodium_memzero(computed_mac, sizeof(computed_mac));
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - HMAC computation failed");
+        return NULL;
+    }
+
+    /* Constant-time comparison: do NOT use memcmp here. sodium_memcmp returns
+     * 0 on match, -1 on mismatch, and does not short-circuit on first diff -
+     * so an attacker cannot recover the expected MAC byte-by-byte via timing. */
+    if (sodium_memcmp(computed_mac, buf + mac_offset, SF_CACHE_AUTH_MAC_LEN) != 0) {
+        sodium_memzero(key, sizeof(key));
+        sodium_memzero(computed_mac, sizeof(computed_mac));
+        zend_string_release(contents);
+        php_error_docref(NULL, E_WARNING,
+            "Signalforge\\Routing: route cache refused - HMAC mismatch "
+            "(file tampered, wrong key, or produced by a different deployment)");
+        return NULL;
+    }
+
+    /* Authenticated: safe to deserialize the payload. */
+    sodium_memzero(key, sizeof(key));
+    sodium_memzero(computed_mac, sizeof(computed_mac));
+
+    const char *payload = (const char *)(buf + SF_CACHE_AUTH_HDR_LEN);
+    size_t payload_len = auth_len - SF_CACHE_AUTH_HDR_LEN;
+
+    sf_router *router = sf_router_unserialize(payload, payload_len);
     zend_string_release(contents);
 
     return router;
@@ -3150,10 +3492,14 @@ sf_http_method sf_method_from_string(const char *method, size_t len)
         if (strncasecmp(method, "OPTIONS", 7) == 0) return SF_METHOD_OPTIONS;
     }
 
+    /* Unknown method: return a dedicated sentinel instead of silently
+     * defaulting to GET. Falling through to GET meant an attacker could reach
+     * any GET route with garbage like `METHOD: BANANA`. The dispatcher must
+     * treat SF_METHOD_UNKNOWN as 501 Not Implemented. */
     php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Unknown HTTP method '%.*s', defaulting to GET",
+        "Signalforge\\Routing: Unknown HTTP method '%.*s'",
         (int)(len > 20 ? 20 : len), method);
-    return SF_METHOD_GET;
+    return SF_METHOD_UNKNOWN;
 }
 
 const char *sf_method_to_string(sf_http_method method)
@@ -3162,8 +3508,13 @@ const char *sf_method_to_string(sf_http_method method)
         "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "ANY", "CLI"
     };
 
-    if (method >= SF_METHOD_COUNT) {
-        /* LOW-04 fix: Warn about invalid method value */
+    /* Defence-in-depth: bound check against the actual array size, not just
+     * SF_METHOD_COUNT. If the enum is extended without updating `methods[]`,
+     * the SF_METHOD_COUNT check would let the bad value through and we'd OOB-
+     * read. ARRAY_SIZE keeps the two in sync. (audit L-R-2) */
+    static const size_t method_array_size = sizeof(methods) / sizeof(methods[0]);
+
+    if (method >= SF_METHOD_COUNT || (size_t)method >= method_array_size) {
         php_error_docref(NULL, E_NOTICE,
             "Signalforge\\Routing: Invalid HTTP method value %d, defaulting to GET", method);
         return "GET";

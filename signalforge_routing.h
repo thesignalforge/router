@@ -59,6 +59,7 @@ typedef struct _sf_router_object {
 /* Route PHP object */
 typedef struct _sf_route_object {
     sf_route *route;
+    zval owner_router;  /* Back-reference to owning Router object (for named_routes registry) */
     zend_object std;
 } sf_route_object;
 
@@ -153,26 +154,26 @@ PHP_RSHUTDOWN_FUNCTION(signalforge_routing);
 PHP_MINFO_FUNCTION(signalforge_routing);
 
 /* ============================================================================
- * Globals Declaration
+ * Instance Method Helper Macro
  * ============================================================================ */
 
-ZEND_BEGIN_MODULE_GLOBALS(signalforge_routing)
-    sf_router *global_router;
-ZEND_END_MODULE_GLOBALS(signalforge_routing)
-
-ZEND_EXTERN_MODULE_GLOBALS(signalforge_routing)
-
-#ifdef ZTS
-#include "TSRM.h"
-#define SF_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(signalforge_routing, v)
-#else
-#define SF_G(v) (signalforge_routing_globals.v)
-#endif
+/*
+ * Extract the sf_router pointer from $this in Router instance methods.
+ * Throws an exception if the router was not initialized via __construct().
+ */
+#define SF_ROUTER_FROM_THIS() \
+	sf_router_object *obj = Z_ROUTER_OBJ_P(getThis()); \
+	sf_router *router = obj->router; \
+	if (UNEXPECTED(!router)) { \
+		zend_throw_exception(zend_ce_exception, "Router not initialized", 0); \
+		RETURN_THROWS(); \
+	}
 
 /* ============================================================================
- * Static Method Declarations - Router
+ * Method Declarations - Router (instance methods)
  * ============================================================================ */
 
+PHP_METHOD(Signalforge_Routing_Router, __construct);
 PHP_METHOD(Signalforge_Routing_Router, get);
 PHP_METHOD(Signalforge_Routing_Router, post);
 PHP_METHOD(Signalforge_Routing_Router, put);
@@ -182,11 +183,6 @@ PHP_METHOD(Signalforge_Routing_Router, options);
 PHP_METHOD(Signalforge_Routing_Router, any);
 PHP_METHOD(Signalforge_Routing_Router, match);
 PHP_METHOD(Signalforge_Routing_Router, group);
-PHP_METHOD(Signalforge_Routing_Router, prefix);
-PHP_METHOD(Signalforge_Routing_Router, middleware);
-PHP_METHOD(Signalforge_Routing_Router, domain);
-PHP_METHOD(Signalforge_Routing_Router, namespace_);
-PHP_METHOD(Signalforge_Routing_Router, name);
 PHP_METHOD(Signalforge_Routing_Router, fallback);
 PHP_METHOD(Signalforge_Routing_Router, url);
 PHP_METHOD(Signalforge_Routing_Router, has);
@@ -196,7 +192,6 @@ PHP_METHOD(Signalforge_Routing_Router, flush);
 PHP_METHOD(Signalforge_Routing_Router, cache);
 PHP_METHOD(Signalforge_Routing_Router, loadCache);
 PHP_METHOD(Signalforge_Routing_Router, dump);
-PHP_METHOD(Signalforge_Routing_Router, getInstance);
 PHP_METHOD(Signalforge_Routing_Router, cli);
 PHP_METHOD(Signalforge_Routing_Router, routeUsing);
 PHP_METHOD(Signalforge_Routing_Router, resolver);

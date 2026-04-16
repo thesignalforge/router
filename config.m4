@@ -61,10 +61,47 @@ if test "$PHP_SIGNALFORGE_ROUTING" != "no"; then
     #define PCRE2_CODE_UNIT_WIDTH 8
   ])
 
+  dnl Locate libsodium (required for authenticated route cache HMAC).
+  dnl
+  dnl We try pkg-config first, then common locations, then fall back to the
+  dnl sibling ext/dotenv local tree which ships a prebuilt libsodium. This
+  dnl last path exists so the extension can be built on dev boxes where the
+  dnl distro libsodium-dev package is unavailable but libsodium.so.23 is
+  dnl already installed at the system level.
+  AC_MSG_CHECKING([for libsodium])
+  SODIUM_CFLAGS=""
+  SODIUM_LIBS=""
+
+  if test "$PKG_CONFIG" != "no" && $PKG_CONFIG --exists libsodium; then
+    SODIUM_CFLAGS=`$PKG_CONFIG --cflags libsodium`
+    SODIUM_LIBS=`$PKG_CONFIG --libs libsodium`
+    AC_MSG_RESULT([found via pkg-config])
+  elif test -f /usr/include/sodium.h; then
+    SODIUM_CFLAGS=""
+    SODIUM_LIBS="-lsodium"
+    AC_MSG_RESULT([found in /usr])
+  elif test -f /usr/local/include/sodium.h; then
+    SODIUM_CFLAGS="-I/usr/local/include"
+    SODIUM_LIBS="-L/usr/local/lib -lsodium"
+    AC_MSG_RESULT([found in /usr/local])
+  elif test -f "$abs_srcdir/../dotenv/local/include/sodium.h"; then
+    SODIUM_ABS="`cd "$abs_srcdir/../dotenv/local" && pwd`"
+    SODIUM_CFLAGS="-I$SODIUM_ABS/include"
+    SODIUM_LIBS="-L$SODIUM_ABS/lib -Wl,-rpath,$SODIUM_ABS/lib -lsodium"
+    AC_MSG_RESULT([found in sibling ext/dotenv/local])
+  else
+    AC_MSG_ERROR([Cannot find libsodium. Please install libsodium-dev])
+  fi
+
+  PHP_EVAL_INCLINE($SODIUM_CFLAGS)
+  PHP_EVAL_LIBLINE($SODIUM_LIBS, SIGNALFORGE_ROUTING_SHARED_LIBADD)
+
+  AC_DEFINE([HAVE_SIGNALFORGE_SODIUM], [1], [Have libsodium for route cache HMAC])
+
   dnl Source files
   PHP_NEW_EXTENSION(signalforge_routing,
     signalforge_routing.c routing_trie.c,
-    $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 $PCRE2_CFLAGS)
+    $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1 $PCRE2_CFLAGS $SODIUM_CFLAGS)
 
   PHP_SUBST(SIGNALFORGE_ROUTING_SHARED_LIBADD)
 

@@ -71,7 +71,11 @@ typedef enum {
     SF_METHOD_HEAD    = 6,
     SF_METHOD_ANY     = 7,
     SF_METHOD_CLI     = 8,
-    SF_METHOD_COUNT   = 9
+    SF_METHOD_COUNT   = 9,
+    /* Sentinel: returned by sf_method_from_string() for unrecognized method
+     * names. Callers must treat this as 501 Not Implemented — never fall
+     * through to GET (that silently opened GET routes to any garbage method). */
+    SF_METHOD_UNKNOWN = 0xFF
 } sf_http_method;
 
 /* Trie node type enumeration */
@@ -179,6 +183,8 @@ struct _sf_match_result {
     zend_bool matched;              /* Whether a match was found */
     zend_string *error;             /* Error message if match failed */
     sf_proxy_response *proxy_response; /* Set after proxy execution (nullable) */
+    zend_bool method_not_allowed;   /* Path matched but HTTP method did not */
+    uint16_t allowed_methods_mask;  /* Bitmask of allowed methods when method_not_allowed set */
 };
 
 /* Route group context */

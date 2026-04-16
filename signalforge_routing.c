@@ -19,9 +19,14 @@
 #include "main/php_globals.h"
 #include <ctype.h>
 #include "ext/standard/url.h"
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
 
-/* Global variables */
-ZEND_DECLARE_MODULE_GLOBALS(signalforge_routing)
+/* No module globals — Router is instance-based */
 
 /* Class entries */
 zend_class_entry *sf_router_ce = NULL;
@@ -77,6 +82,7 @@ zend_object *sf_route_object_create(zend_class_entry *ce)
     object_properties_init(&intern->std, ce);
 
     intern->route = NULL;
+    ZVAL_UNDEF(&intern->owner_router);
     intern->std.handlers = &sf_route_object_handlers;
 
     return &intern->std;
@@ -90,6 +96,8 @@ void sf_route_object_free(zend_object *obj)
         intern->route->php_object = NULL;
         sf_route_release(intern->route);
     }
+
+    zval_ptr_dtor(&intern->owner_router);
 
     zend_object_std_dtor(&intern->std);
 }
@@ -194,19 +202,12 @@ void sf_proxy_response_object_free(zend_object *obj)
  * Helper Functions
  * ============================================================================ */
 
-static sf_router *sf_get_global_router(void)
-{
-    if (!SF_G(global_router)) {
-        SF_G(global_router) = sf_router_create();
-    }
-    return SF_G(global_router);
-}
-
 /**
  * Wrap a route in a PHP Route object. Takes ownership of an existing reference
  * (the caller's ref is transferred to the PHP object — do NOT release after calling).
+ * owner_zv is a zval* pointing to the owning Router object (may be NULL).
  */
-static sf_route_object *sf_wrap_route(sf_route *route)
+static sf_route_object *sf_wrap_route(sf_route *route, zval *owner_zv)
 {
     if (!route) {
         return NULL;
@@ -217,6 +218,9 @@ static sf_route_object *sf_wrap_route(sf_route *route)
     sf_route_object *obj = Z_ROUTE_OBJ_P(&rv);
     obj->route = route;
     route->php_object = Z_OBJ(rv);
+    if (owner_zv) {
+        ZVAL_COPY(&obj->owner_router, owner_zv);
+    }
 
     return obj;
 }
@@ -236,8 +240,17 @@ static sf_match_result_object *sf_wrap_match_result(sf_match_result *result)
 }
 
 /* ============================================================================
- * Router Static Methods
+ * Router Instance Methods
  * ============================================================================ */
+
+PHP_METHOD(Signalforge_Routing_Router, __construct)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_router_object *obj = Z_ROUTER_OBJ_P(getThis());
+    obj->router = sf_router_create();
+    obj->owns_router = 1;
+}
 
 /* Helper for HTTP method registration */
 static void sf_router_register_method(INTERNAL_FUNCTION_PARAMETERS, sf_http_method method)
@@ -250,7 +263,8 @@ static void sf_router_register_method(INTERNAL_FUNCTION_PARAMETERS, sf_http_meth
         Z_PARAM_ZVAL(handler)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
+
     sf_route *route = sf_router_add_route(router, method, uri, handler);
 
     if (!route) {
@@ -266,6 +280,8 @@ static void sf_router_register_method(INTERNAL_FUNCTION_PARAMETERS, sf_http_meth
     sf_route_object *route_obj = Z_ROUTE_OBJ_P(return_value);
     route_obj->route = route;
     route->php_object = Z_OBJ_P(return_value);
+    /* Store back-reference to owning Router for Route::name() registry updates */
+    ZVAL_COPY(&route_obj->owner_router, getThis());
 }
 
 PHP_METHOD(Signalforge_Routing_Router, get)
@@ -316,7 +332,7 @@ PHP_METHOD(Signalforge_Routing_Router, match)
         Z_PARAM_STR_OR_NULL(domain)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     sf_http_method method = sf_method_from_string(ZSTR_VAL(method_str), ZSTR_LEN(method_str));
 
     sf_match_result *result;
@@ -351,7 +367,7 @@ PHP_METHOD(Signalforge_Routing_Router, group)
         Z_PARAM_FUNC(fci, fcc)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     sf_route_group *group = sf_route_group_create();
 
     /* Parse attributes */
@@ -428,12 +444,17 @@ PHP_METHOD(Signalforge_Routing_Router, group)
     /* Enter group context */
     sf_router_begin_group(router, group);
 
-    /* Call the callback */
+    /* Call the callback with $this as the first argument */
     zval retval;
+    zval args[1];
+    ZVAL_COPY(&args[0], getThis());
     ZVAL_UNDEF(&retval);
     fci.retval = &retval;
+    fci.params = args;
+    fci.param_count = 1;
     if (zend_call_function(&fci, &fcc) == FAILURE || EG(exception)) {
         sf_router_end_group(router);
+        zval_ptr_dtor(&args[0]);
         zval_ptr_dtor(&retval);
         if (!EG(exception)) {
             zend_throw_exception(sf_routing_exception_ce,
@@ -442,85 +463,11 @@ PHP_METHOD(Signalforge_Routing_Router, group)
         RETURN_THROWS();
     }
 
+    zval_ptr_dtor(&args[0]);
     zval_ptr_dtor(&retval);
 
     /* Exit group context */
     sf_router_end_group(router);
-}
-
-PHP_METHOD(Signalforge_Routing_Router, prefix)
-{
-    zend_string *prefix;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(prefix)
-    ZEND_PARSE_PARAMETERS_END();
-
-    php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Router::prefix() without group() has no effect. "
-        "Use Router::group(['prefix' => '...'], callback) instead");
-
-    RETURN_NULL();
-}
-
-PHP_METHOD(Signalforge_Routing_Router, middleware)
-{
-    zval *middleware;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(middleware)
-    ZEND_PARSE_PARAMETERS_END();
-
-    php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Router::middleware() without group() has no effect. "
-        "Use Router::group(['middleware' => [...]], callback) instead");
-
-    RETURN_NULL();
-}
-
-PHP_METHOD(Signalforge_Routing_Router, domain)
-{
-    zend_string *domain;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(domain)
-    ZEND_PARSE_PARAMETERS_END();
-
-    php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Router::domain() without group() has no effect. "
-        "Use Router::group(['domain' => '...'], callback) instead");
-
-    RETURN_NULL();
-}
-
-PHP_METHOD(Signalforge_Routing_Router, namespace_)
-{
-    zend_string *ns;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(ns)
-    ZEND_PARSE_PARAMETERS_END();
-
-    php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Router::namespace() without group() has no effect. "
-        "Use Router::group(['namespace' => '...'], callback) instead");
-
-    RETURN_NULL();
-}
-
-PHP_METHOD(Signalforge_Routing_Router, name)
-{
-    zend_string *name;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(name)
-    ZEND_PARSE_PARAMETERS_END();
-
-    php_error_docref(NULL, E_WARNING,
-        "Signalforge\\Routing: Router::name() without group() has no effect. "
-        "Use Router::group(['as' => '...'], callback) instead");
-
-    RETURN_NULL();
 }
 
 PHP_METHOD(Signalforge_Routing_Router, fallback)
@@ -531,7 +478,7 @@ PHP_METHOD(Signalforge_Routing_Router, fallback)
         Z_PARAM_ZVAL(handler)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     sf_route *route = sf_route_create();
     route->uri = zend_string_init("*", 1, 0);
@@ -551,6 +498,7 @@ PHP_METHOD(Signalforge_Routing_Router, fallback)
     object_init_ex(return_value, sf_route_ce);
     sf_route_object *route_obj = Z_ROUTE_OBJ_P(return_value);
     route_obj->route = route;
+    ZVAL_COPY(&route_obj->owner_router, getThis());
 }
 
 PHP_METHOD(Signalforge_Routing_Router, url)
@@ -564,7 +512,7 @@ PHP_METHOD(Signalforge_Routing_Router, url)
         Z_PARAM_ARRAY_HT_OR_NULL(params)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     zend_string *url = sf_router_url(router, name, params);
 
     if (!url) {
@@ -582,7 +530,7 @@ PHP_METHOD(Signalforge_Routing_Router, has)
         Z_PARAM_STR(name)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     RETURN_BOOL(sf_router_has_route(router, name));
 }
 
@@ -594,22 +542,23 @@ PHP_METHOD(Signalforge_Routing_Router, route)
         Z_PARAM_STR(name)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
+
     sf_route *route = sf_router_get_route(router, name);
 
     if (!route) {
         RETURN_NULL();
     }
 
-    sf_route_object *obj = sf_wrap_route(route);
-    RETURN_OBJ(&obj->std);
+    sf_route_object *robj = sf_wrap_route(route, getThis());
+    RETURN_OBJ(&robj->std);
 }
 
 PHP_METHOD(Signalforge_Routing_Router, getRoutes)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     array_init(return_value);
 
@@ -623,9 +572,10 @@ PHP_METHOD(Signalforge_Routing_Router, getRoutes)
         if (route) {
             zval wrapped;
             object_init_ex(&wrapped, sf_route_ce);
-            sf_route_object *obj = Z_ROUTE_OBJ_P(&wrapped);
-            obj->route = route;
+            sf_route_object *robj = Z_ROUTE_OBJ_P(&wrapped);
+            robj->route = route;
             sf_route_addref(route);
+            ZVAL_COPY(&robj->owner_router, getThis());
             add_next_index_zval(return_value, &wrapped);
         }
     } ZEND_HASH_FOREACH_END();
@@ -635,7 +585,7 @@ PHP_METHOD(Signalforge_Routing_Router, flush)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     sf_router_reset(router);
 
     RETURN_NULL();
@@ -649,7 +599,7 @@ PHP_METHOD(Signalforge_Routing_Router, cache)
         Z_PARAM_STR(path)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
     RETURN_BOOL(sf_router_cache_to_file(router, ZSTR_VAL(path)));
 }
 
@@ -661,16 +611,19 @@ PHP_METHOD(Signalforge_Routing_Router, loadCache)
         Z_PARAM_STR(path)
     ZEND_PARSE_PARAMETERS_END();
 
+    sf_router_object *obj = Z_ROUTER_OBJ_P(getThis());
+
     sf_router *loaded = sf_router_load_from_file(ZSTR_VAL(path));
     if (!loaded) {
         RETURN_FALSE;
     }
 
-    /* Replace global router */
-    if (SF_G(global_router)) {
-        sf_router_destroy(SF_G(global_router));
+    /* Replace instance's router */
+    if (obj->router && obj->owns_router) {
+        sf_router_destroy(obj->router);
     }
-    SF_G(global_router) = loaded;
+    obj->router = loaded;
+    obj->owns_router = 1;
 
     RETURN_TRUE;
 }
@@ -679,7 +632,7 @@ PHP_METHOD(Signalforge_Routing_Router, dump)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     php_printf("=== Signalforge Router Dump ===\n");
     php_printf("Route count: %u\n", router->route_count);
@@ -691,15 +644,6 @@ PHP_METHOD(Signalforge_Routing_Router, dump)
     }
 
     RETURN_NULL();
-}
-
-PHP_METHOD(Signalforge_Routing_Router, getInstance)
-{
-    ZEND_PARSE_PARAMETERS_NONE();
-
-    object_init_ex(return_value, sf_router_ce);
-    sf_router_object *obj = Z_ROUTER_OBJ_P(return_value);
-    obj->router = sf_get_global_router();
 }
 
 PHP_METHOD(Signalforge_Routing_Router, cli)
@@ -782,7 +726,7 @@ PHP_METHOD(Signalforge_Routing_Router, routeUsing)
         Z_PARAM_FUNC(fci, fcc)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     if (sf_call_resolver_and_store(router, &fci.function_name, input) != SUCCESS) {
         RETURN_THROWS();
@@ -800,7 +744,7 @@ PHP_METHOD(Signalforge_Routing_Router, resolver)
         Z_PARAM_FUNC(fci, fcc)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     if (!Z_ISUNDEF(router->dispatch_resolver)) {
         zval_ptr_dtor(&router->dispatch_resolver);
@@ -826,13 +770,13 @@ PHP_METHOD(Signalforge_Routing_Router, dispatch)
         Z_PARAM_ZVAL(input)
     ZEND_PARSE_PARAMETERS_END();
 
-    sf_router *router = sf_get_global_router();
+    SF_ROUTER_FROM_THIS();
 
     /* If input provided, resolve via stored resolver */
     if (input && Z_TYPE_P(input) != IS_NULL) {
         if (Z_ISUNDEF(router->dispatch_resolver)) {
             zend_throw_exception(sf_routing_exception_ce,
-                "No resolver set. Call Router::resolver() before Router::dispatch($input)", 0);
+                "No resolver set. Call $router->resolver() before $router->dispatch($input)", 0);
             RETURN_THROWS();
         }
         /* Copy the resolver before calling — the callback could modify/free
@@ -848,7 +792,7 @@ PHP_METHOD(Signalforge_Routing_Router, dispatch)
 
     if (!router->dispatch_method) {
         zend_throw_exception(sf_routing_exception_ce,
-            "No routing context set. Call Router::routeUsing() or Router::resolver() before Router::dispatch()", 0);
+            "No routing context set. Call $router->routeUsing() or $router->resolver() before $router->dispatch()", 0);
         RETURN_THROWS();
     }
 
@@ -968,11 +912,15 @@ PHP_METHOD(Signalforge_Routing_Route, name)
 
     sf_route_set_name(intern->route, name);
 
-    /* Update named routes registry */
-    sf_router *router = sf_get_global_router();
-    zval zv;
-    ZVAL_PTR(&zv, intern->route);
-    zend_hash_update(router->named_routes, name, &zv);
+    /* Update named routes registry on the owning Router */
+    if (!Z_ISUNDEF(intern->owner_router)) {
+        sf_router_object *router_obj = Z_ROUTER_OBJ_P(&intern->owner_router);
+        if (router_obj->router) {
+            zval zv;
+            ZVAL_PTR(&zv, intern->route);
+            zend_hash_update(router_obj->router->named_routes, name, &zv);
+        }
+    }
 
     RETURN_ZVAL(ZEND_THIS, 1, 0);
 }
@@ -1641,6 +1589,39 @@ PHP_METHOD(Signalforge_Routing_MatchResult, getProxyResponse)
     object_init_ex(return_value, sf_proxy_response_ce);
     sf_proxy_response_object *resp_obj = Z_PROXY_RESPONSE_OBJ_P(return_value);
     resp_obj->response = sf_proxy_response_clone(intern->result->proxy_response);
+}
+
+PHP_METHOD(Signalforge_Routing_MatchResult, isMethodNotAllowed)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    sf_match_result_object *intern = Z_MATCH_RESULT_OBJ_P(ZEND_THIS);
+    if (!intern->result) {
+        RETURN_FALSE;
+    }
+
+    RETURN_BOOL(intern->result->method_not_allowed);
+}
+
+PHP_METHOD(Signalforge_Routing_MatchResult, getAllowedMethods)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    array_init(return_value);
+
+    sf_match_result_object *intern = Z_MATCH_RESULT_OBJ_P(ZEND_THIS);
+    if (!intern->result || !intern->result->method_not_allowed) {
+        return;
+    }
+
+    /* Expand the bitmask into a method-name list. Order matches the enum so
+     * the Allow header ends up stable (helps tests and downstream caches). */
+    uint16_t mask = intern->result->allowed_methods_mask;
+    for (int m = 0; m < SF_METHOD_COUNT; m++) {
+        if (mask & (uint16_t)(1u << m)) {
+            add_next_index_string(return_value, sf_method_to_string((sf_http_method)m));
+        }
+    }
 }
 
 /* ============================================================================
@@ -2322,7 +2303,10 @@ static sf_proxy_request *sf_proxy_build_request_from_sapi(zend_string *url, sf_h
     zend_string *body = NULL;
     php_stream *input = php_stream_open_wrapper("php://input", "rb", 0, NULL);
     if (input) {
-        body = php_stream_copy_to_mem(input, PHP_STREAM_COPY_ALL, 0);
+        /* Bounded read — see signalforge_routing.proxy_max_body_size (audit H-R-5) */
+        zend_long limit = INI_INT("signalforge_routing.proxy_max_body_size");
+        size_t maxlen = (limit > 0) ? (size_t)limit : PHP_STREAM_COPY_ALL;
+        body = php_stream_copy_to_mem(input, maxlen, 0);
         php_stream_close(input);
     }
 
@@ -2338,15 +2322,288 @@ static sf_proxy_request *sf_proxy_build_request_from_sapi(zend_string *url, sf_h
     return req;
 }
 
+/* ============================================================================
+ * SSRF hardening for proxy upstream
+ *
+ * The old scheme check was cosmetic: it rejected file://, but still happily
+ * proxied to http://127.0.0.1, http://10.0.0.1, or — worst of all —
+ * http://169.254.169.254 (AWS/GCP/Azure/OpenStack instance metadata). Any
+ * PHP process that could register a proxy route could steal cloud creds.
+ *
+ * We now:
+ *   1. Reject known-dangerous schemes explicitly (belt-and-braces with the
+ *      http/https allowlist) so a typo in the allowlist never opens the gate.
+ *   2. Resolve the hostname with getaddrinfo() and check EVERY returned
+ *      address against a blocklist (RFC1918, loopback, link-local, IPv6
+ *      equivalents, plus the cloud metadata address). If ANY resolved IP is
+ *      blocked, the request fails — TOCTOU mitigations at the DNS level are
+ *      out of scope for this PR, but checking all addresses at least closes
+ *      the "one good, one bad" A-record trick.
+ *   3. Offer an opt-in for internal service mesh testing, with a SEPARATE
+ *      opt-in specifically for the metadata endpoint so a sloppy "allow
+ *      private" flag cannot silently expose cloud credentials.
+ * ============================================================================ */
+
+static zend_bool sf_ipv4_is_blocked(uint32_t addr_host_order, zend_bool allow_private,
+                                    zend_bool allow_metadata)
+{
+    /* Metadata endpoint 169.254.169.254 is checked FIRST and IGNORES the
+     * allow_private flag. The separate allow_metadata flag is the only way
+     * to permit it — this prevents "allow private" footguns from exposing
+     * cloud creds. */
+    const uint32_t metadata = (169u << 24) | (254u << 16) | (169u << 8) | 254u;
+    if (addr_host_order == metadata) {
+        return !allow_metadata;
+    }
+
+    if (allow_private) {
+        return 0;
+    }
+
+    /* 127.0.0.0/8 loopback */
+    if ((addr_host_order & 0xFF000000u) == 0x7F000000u) return 1;
+    /* 10.0.0.0/8 RFC1918 */
+    if ((addr_host_order & 0xFF000000u) == 0x0A000000u) return 1;
+    /* 172.16.0.0/12 RFC1918 */
+    if ((addr_host_order & 0xFFF00000u) == 0xAC100000u) return 1;
+    /* 192.168.0.0/16 RFC1918 */
+    if ((addr_host_order & 0xFFFF0000u) == 0xC0A80000u) return 1;
+    /* 169.254.0.0/16 link-local (includes metadata, handled above) */
+    if ((addr_host_order & 0xFFFF0000u) == 0xA9FE0000u) return 1;
+    /* 0.0.0.0/8 "this network" - should never be a valid proxy target */
+    if ((addr_host_order & 0xFF000000u) == 0x00000000u) return 1;
+    /* 100.64.0.0/10 carrier-grade NAT */
+    if ((addr_host_order & 0xFFC00000u) == 0x64400000u) return 1;
+    /* 224.0.0.0/4 multicast */
+    if ((addr_host_order & 0xF0000000u) == 0xE0000000u) return 1;
+    /* 240.0.0.0/4 reserved */
+    if ((addr_host_order & 0xF0000000u) == 0xF0000000u) return 1;
+
+    return 0;
+}
+
+static zend_bool sf_ipv6_is_blocked(const struct in6_addr *a6, zend_bool allow_private,
+                                    zend_bool allow_metadata)
+{
+    const uint8_t *b = a6->s6_addr;
+
+    /* IPv4-mapped (::ffff:x.x.x.x) — pull the v4 tail and reuse v4 rules. */
+    static const uint8_t v4mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    if (memcmp(b, v4mapped_prefix, 12) == 0) {
+        uint32_t v4 = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16)
+                    | ((uint32_t)b[14] << 8)  |  (uint32_t)b[15];
+        return sf_ipv4_is_blocked(v4, allow_private, allow_metadata);
+    }
+
+    /* IPv4-compatible (::0:0:0:x.x.x.x) is deprecated and should be blocked. */
+    static const uint8_t zeroes12[12] = {0};
+    if (memcmp(b, zeroes12, 12) == 0 &&
+        !(b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] <= 1)) {
+        /* ::x.x.x.x but not ::0 or ::1 - treat as suspicious, block. */
+        return !allow_private;
+    }
+
+    /* ::1 loopback */
+    static const uint8_t loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    if (memcmp(b, loopback, 16) == 0) {
+        return !allow_private;
+    }
+
+    /* :: unspecified */
+    static const uint8_t unspec[16] = {0};
+    if (memcmp(b, unspec, 16) == 0) {
+        return 1;
+    }
+
+    /* fc00::/7 unique local addresses */
+    if ((b[0] & 0xFE) == 0xFC) {
+        return !allow_private;
+    }
+
+    /* fe80::/10 link-local */
+    if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) {
+        return !allow_private;
+    }
+
+    /* ff00::/8 multicast */
+    if (b[0] == 0xFF) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Parse scheme://host[:port] out of a URL and write the host into `host_out`
+ * (NUL-terminated). Returns 1 on success. Does NOT validate the scheme — the
+ * caller has already enforced http/https — but does reject clearly malformed
+ * URLs.
+ */
+static zend_bool sf_extract_host(const char *url, size_t url_len,
+                                 char *host_out, size_t host_out_size)
+{
+    const char *sep = memchr(url, ':', url_len);
+    if (!sep) return 0;
+    size_t scheme_len = (size_t)(sep - url);
+    if (url_len < scheme_len + 3) return 0;
+    if (sep[1] != '/' || sep[2] != '/') return 0;
+
+    const char *host_start = sep + 3;
+    const char *url_end = url + url_len;
+
+    /* Skip userinfo if present (user:pass@). The '@' is the rightmost one
+     * before the first '/', '?', '#', or end-of-url. */
+    const char *path_start = host_start;
+    while (path_start < url_end && *path_start != '/' &&
+           *path_start != '?' && *path_start != '#') {
+        path_start++;
+    }
+    const char *at = NULL;
+    for (const char *p = host_start; p < path_start; p++) {
+        if (*p == '@') at = p;
+    }
+    if (at) host_start = at + 1;
+
+    /* Host may be an IPv6 literal in brackets: [::1]:8080 */
+    const char *host_end;
+    if (host_start < url_end && *host_start == '[') {
+        host_start++;
+        host_end = memchr(host_start, ']', (size_t)(url_end - host_start));
+        if (!host_end) return 0;
+    } else {
+        host_end = host_start;
+        while (host_end < path_start && *host_end != ':') host_end++;
+    }
+
+    size_t host_len = (size_t)(host_end - host_start);
+    if (host_len == 0 || host_len + 1 > host_out_size) return 0;
+    memcpy(host_out, host_start, host_len);
+    host_out[host_len] = '\0';
+    return 1;
+}
+
+/*
+ * Resolve the URL's hostname and reject if any resolved address lands in a
+ * blocked range. Returns 1 if safe to proceed, 0 otherwise (exception thrown).
+ */
+static zend_bool sf_validate_upstream_host(const char *url, size_t url_len)
+{
+    zend_bool allow_private  = INI_INT("signalforge_routing.proxy_allow_private") != 0;
+    zend_bool allow_metadata = INI_INT("signalforge_routing.proxy_allow_metadata_endpoint") != 0;
+
+    char host[256];
+    if (!sf_extract_host(url, url_len, host, sizeof(host))) {
+        zend_throw_exception(sf_routing_exception_ce,
+            "Proxy URL is malformed: cannot extract hostname", 0);
+        return 0;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    /* No AI_NUMERICHOST — we want DNS resolution. No AI_NUMERICSERV either;
+     * we only care about the address here, not the port. */
+
+    struct addrinfo *res = NULL;
+    int gai_err = getaddrinfo(host, NULL, &hints, &res);
+    if (gai_err != 0 || !res) {
+        zend_throw_exception_ex(sf_routing_exception_ce, 0,
+            "Proxy upstream DNS resolution failed for host '%s': %s",
+            host, gai_strerror(gai_err));
+        if (res) freeaddrinfo(res);
+        return 0;
+    }
+
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (ai->ai_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+            uint32_t v4 = ntohl(sin->sin_addr.s_addr);
+            if (sf_ipv4_is_blocked(v4, allow_private, allow_metadata)) {
+                char buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+                freeaddrinfo(res);
+                zend_throw_exception_ex(sf_routing_exception_ce, 0,
+                    "Proxy upstream host '%s' resolves to blocked address %s "
+                    "(internal/loopback/metadata). Configure "
+                    "signalforge_routing.proxy_allow_private=1 to allow private "
+                    "ranges; use signalforge_routing.proxy_allow_metadata_endpoint=1 "
+                    "to explicitly permit cloud metadata.",
+                    host, buf);
+                return 0;
+            }
+        } else if (ai->ai_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+            if (sf_ipv6_is_blocked(&sin6->sin6_addr, allow_private, allow_metadata)) {
+                char buf[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
+                freeaddrinfo(res);
+                zend_throw_exception_ex(sf_routing_exception_ce, 0,
+                    "Proxy upstream host '%s' resolves to blocked address %s "
+                    "(internal/loopback/metadata). Configure "
+                    "signalforge_routing.proxy_allow_private=1 to allow private "
+                    "ranges; use signalforge_routing.proxy_allow_metadata_endpoint=1 "
+                    "to explicitly permit cloud metadata.",
+                    host, buf);
+                return 0;
+            }
+        }
+        /* Silently ignore other address families (AF_UNSPEC fallback). */
+    }
+
+    freeaddrinfo(res);
+    return 1;
+}
+
 static sf_proxy_response *sf_proxy_execute(sf_proxy_request *req, sf_proxy_options *opts)
 {
-    /* Validate URL scheme — defense-in-depth against onRequest SSRF bypass */
     const char *url_check = ZSTR_VAL(req->url);
-    if (ZSTR_LEN(req->url) < 8 ||
+    size_t url_len = ZSTR_LEN(req->url);
+
+    /* Reject dangerous schemes up front — belt-and-braces with the allowlist
+     * below so a future refactor of the allowlist cannot silently re-enable
+     * file://, gopher://, dict://, ftp://. These are classic SSRF-smuggling
+     * schemes PHP's http fopen wrapper does not even speak, but an errant
+     * stream wrapper could. */
+    static const struct { const char *s; size_t n; } denied_schemes[] = {
+        {"file://",   7},
+        {"gopher://", 9},
+        {"dict://",   7},
+        {"ftp://",    6},
+        {"ftps://",   7},
+        {"php://",    6},
+        {"data://",   7},
+        {"glob://",   7},
+        {"phar://",   7},
+        {"ssh2://",   7},
+        {"zlib://",   7},
+        {"ogg://",    6},
+        {"expect://", 9},
+    };
+    for (size_t i = 0; i < sizeof(denied_schemes)/sizeof(denied_schemes[0]); i++) {
+        if (url_len >= denied_schemes[i].n &&
+            strncasecmp(url_check, denied_schemes[i].s, denied_schemes[i].n) == 0) {
+            zend_throw_exception_ex(sf_routing_exception_ce, 0,
+                "Proxy request URL scheme '%.*s' is not allowed",
+                (int)(denied_schemes[i].n - 3), denied_schemes[i].s);
+            return NULL;
+        }
+    }
+
+    /* Positive check: must be http:// or https://. Defense-in-depth against
+     * onRequest callbacks that might rewrite req->url to something exotic. */
+    if (url_len < 8 ||
         (strncasecmp(url_check, "http://", 7) != 0 &&
          strncasecmp(url_check, "https://", 8) != 0)) {
         zend_throw_exception(sf_routing_exception_ce,
             "Proxy request URL must use http:// or https:// scheme", 0);
+        return NULL;
+    }
+
+    /* Resolve the hostname and make sure it doesn't land in private ranges
+     * or the cloud metadata address. This is the core SSRF protection. */
+    if (!sf_validate_upstream_host(url_check, url_len)) {
+        /* Exception already thrown by sf_validate_upstream_host. */
         return NULL;
     }
 
@@ -2386,9 +2643,25 @@ static sf_proxy_response *sf_proxy_execute(sf_proxy_request *req, sf_proxy_optio
     add_assoc_bool(&ssl_opts, "verify_peer", opts->verify_ssl);
     add_assoc_bool(&ssl_opts, "verify_peer_name", opts->verify_ssl);
 
+    /* php_stream_context_set_option() requires a non-NULL optionname - passing
+     * NULL dereferences inside strlen() and segfaults. Iterate the KV pairs
+     * of each opts array and set them one at a time, which is also how PHP's
+     * userland stream_context_set_option handles array input. */
     php_stream_context *ctx = php_stream_context_alloc();
-    php_stream_context_set_option(ctx, "http", NULL, &http_opts);
-    php_stream_context_set_option(ctx, "ssl", NULL, &ssl_opts);
+    {
+        zend_string *opt_key;
+        zval *opt_val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(http_opts), opt_key, opt_val) {
+            if (opt_key) {
+                php_stream_context_set_option(ctx, "http", ZSTR_VAL(opt_key), opt_val);
+            }
+        } ZEND_HASH_FOREACH_END();
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL(ssl_opts), opt_key, opt_val) {
+            if (opt_key) {
+                php_stream_context_set_option(ctx, "ssl", ZSTR_VAL(opt_key), opt_val);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
 
     zval_ptr_dtor(&http_opts);
     zval_ptr_dtor(&ssl_opts);
@@ -2625,6 +2898,9 @@ PHP_METHOD(Signalforge_Routing_RoutingContext, getDomain)
  * Argument Info Definitions
  * ============================================================================ */
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_router_construct, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_route_method, 0, 2, Signalforge\\Routing\\Route, 0)
     ZEND_ARG_TYPE_INFO(0, uri, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, handler, IS_MIXED, 0)
@@ -2639,26 +2915,6 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_group, 0, 2, IS_VOID, 0)
     ZEND_ARG_TYPE_INFO(0, attributes, IS_ARRAY, 0)
     ZEND_ARG_TYPE_INFO(0, callback, IS_CALLABLE, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_prefix, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, prefix, IS_STRING, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_middleware, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, middleware, IS_MIXED, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_domain, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, domain, IS_STRING, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_namespace, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, namespace, IS_STRING, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_name, 0, 1, IS_VOID, 0)
-    ZEND_ARG_TYPE_INFO(0, name, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_fallback, 0, 1, Signalforge\\Routing\\Route, 0)
@@ -2693,9 +2949,6 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_loadCache, 0, 1, _IS_BOOL
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_router_dump, 0, 0, IS_VOID, 0)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_getInstance, 0, 0, Signalforge\\Routing\\Router, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_router_cli, 0, 2, Signalforge\\Routing\\Route, 0)
@@ -2846,6 +3099,12 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_match_getProxyResponse, 0, 0, Signalforge\\Routing\\ProxyResponse, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_match_isMethodNotAllowed, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_match_getAllowedMethods, 0, 0, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 /* ProxyRequest arg info */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_proxy_request_construct, 0, 0, 0)
 ZEND_END_ARG_INFO()
@@ -2929,34 +3188,29 @@ ZEND_END_ARG_INFO()
  * ============================================================================ */
 
 static const zend_function_entry sf_router_methods[] = {
-    PHP_ME(Signalforge_Routing_Router, get, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, post, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, put, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, patch, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, delete, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, options, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, any, arginfo_router_route_method, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, match, arginfo_router_match, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, group, arginfo_router_group, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, prefix, arginfo_router_prefix, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, middleware, arginfo_router_middleware, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, domain, arginfo_router_domain, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_FENTRY(namespace, ZEND_MN(Signalforge_Routing_Router_namespace_), arginfo_router_namespace, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, name, arginfo_router_name, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, fallback, arginfo_router_fallback, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, url, arginfo_router_url, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, has, arginfo_router_has, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, route, arginfo_router_route, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, getRoutes, arginfo_router_getRoutes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, flush, arginfo_router_flush, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, cache, arginfo_router_cache, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, loadCache, arginfo_router_loadCache, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, dump, arginfo_router_dump, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, getInstance, arginfo_router_getInstance, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, cli, arginfo_router_cli, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, routeUsing, arginfo_router_routeUsing, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, resolver, arginfo_router_resolver, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    PHP_ME(Signalforge_Routing_Router, dispatch, arginfo_router_dispatch, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_ME(Signalforge_Routing_Router, __construct, arginfo_router_construct, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, get, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, post, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, put, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, patch, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, delete, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, options, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, any, arginfo_router_route_method, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, match, arginfo_router_match, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, group, arginfo_router_group, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, fallback, arginfo_router_fallback, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, url, arginfo_router_url, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, has, arginfo_router_has, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, route, arginfo_router_route, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, getRoutes, arginfo_router_getRoutes, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, flush, arginfo_router_flush, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, cache, arginfo_router_cache, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, loadCache, arginfo_router_loadCache, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, dump, arginfo_router_dump, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, cli, arginfo_router_cli, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, routeUsing, arginfo_router_routeUsing, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, resolver, arginfo_router_resolver, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_Router, dispatch, arginfo_router_dispatch, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -3001,6 +3255,8 @@ static const zend_function_entry sf_match_result_methods[] = {
     PHP_ME(Signalforge_Routing_MatchResult, param, arginfo_match_param, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, isProxy, arginfo_match_isProxy, ZEND_ACC_PUBLIC)
     PHP_ME(Signalforge_Routing_MatchResult, getProxyResponse, arginfo_match_getProxyResponse, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_MatchResult, isMethodNotAllowed, arginfo_match_isMethodNotAllowed, ZEND_ACC_PUBLIC)
+    PHP_ME(Signalforge_Routing_MatchResult, getAllowedMethods, arginfo_match_getAllowedMethods, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -3042,20 +3298,64 @@ static const zend_function_entry sf_routing_context_methods[] = {
 };
 
 /* ============================================================================
- * Module Lifecycle
+ * INI SETTINGS
+ *
+ * signalforge_routing.proxy_max_body_size — bytes; 0 disables limit.
+ * Caps the body read in sf_proxy_build_request_from_sapi to prevent memory
+ * exhaustion from huge incoming proxy bodies. Default 16 MiB. (audit H-R-5)
+ *
+ * signalforge_routing.cache_key — 64-char hex (32 bytes) HMAC key used to
+ * authenticate route cache files. If unset, cache save/load fail closed with
+ * a warning. The key binds a cache file to a specific deployment; changing it
+ * invalidates all existing caches (by design).
+ *
+ * signalforge_routing.proxy_allow_private — bool (default off). Allows proxy
+ * upstream hosts to resolve to private/link-local/loopback IP ranges. Intended
+ * for internal service mesh testing. The AWS/GCP/Azure metadata endpoint
+ * 169.254.169.254 is still blocked unless proxy_allow_metadata_endpoint is
+ * also enabled (defense-in-depth against credential theft via SSRF).
+ *
+ * signalforge_routing.proxy_allow_metadata_endpoint — bool (default off).
+ * When explicitly enabled, 169.254.169.254 is allowed. Only meaningful if
+ * proxy_allow_private is also on.
  * ============================================================================ */
 
-static void php_signalforge_routing_globals_ctor(zend_signalforge_routing_globals *globals)
-{
-    globals->global_router = NULL;
-}
+PHP_INI_BEGIN()
+    PHP_INI_ENTRY(
+        "signalforge_routing.proxy_max_body_size",
+        "16777216",          /* 16 MiB */
+        PHP_INI_ALL,
+        NULL                 /* No update handler — read live via INI_INT */
+    )
+    PHP_INI_ENTRY(
+        "signalforge_routing.cache_key",
+        "",                  /* Empty = disabled; cache I/O will refuse */
+        PHP_INI_SYSTEM,      /* Cannot be overridden per-request */
+        NULL
+    )
+    PHP_INI_ENTRY(
+        "signalforge_routing.proxy_allow_private",
+        "0",
+        PHP_INI_SYSTEM,
+        NULL
+    )
+    PHP_INI_ENTRY(
+        "signalforge_routing.proxy_allow_metadata_endpoint",
+        "0",
+        PHP_INI_SYSTEM,
+        NULL
+    )
+PHP_INI_END()
+
+/* ============================================================================
+ * Module Lifecycle
+ * ============================================================================ */
 
 PHP_MINIT_FUNCTION(signalforge_routing)
 {
     zend_class_entry ce;
 
-    /* Initialize globals */
-    ZEND_INIT_MODULE_GLOBALS(signalforge_routing, php_signalforge_routing_globals_ctor, NULL);
+    REGISTER_INI_ENTRIES();
 
     /* Register Router class */
     INIT_NS_CLASS_ENTRY(ce, "Signalforge\\Routing", "Router", sf_router_methods);
@@ -3132,6 +3432,7 @@ PHP_MINIT_FUNCTION(signalforge_routing)
 
 PHP_MSHUTDOWN_FUNCTION(signalforge_routing)
 {
+    UNREGISTER_INI_ENTRIES();
     return SUCCESS;
 }
 
@@ -3141,20 +3442,11 @@ PHP_RINIT_FUNCTION(signalforge_routing)
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 
-    /* Create fresh router for each request */
-    SF_G(global_router) = NULL;
-
     return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(signalforge_routing)
 {
-    /* Clean up request-specific data */
-    if (SF_G(global_router)) {
-        sf_router_destroy(SF_G(global_router));
-        SF_G(global_router) = NULL;
-    }
-
     return SUCCESS;
 }
 
@@ -3185,11 +3477,7 @@ zend_module_entry signalforge_routing_module_entry = {
     PHP_RSHUTDOWN(signalforge_routing),
     PHP_MINFO(signalforge_routing),
     PHP_SIGNALFORGE_ROUTING_VERSION,
-    PHP_MODULE_GLOBALS(signalforge_routing),
-    NULL,                               /* GINIT */
-    NULL,                               /* GSHUTDOWN */
-    NULL,                               /* PRSHUTDOWN */
-    STANDARD_MODULE_PROPERTIES_EX
+    STANDARD_MODULE_PROPERTIES
 };
 
 #ifdef COMPILE_DL_SIGNALFORGE_ROUTING

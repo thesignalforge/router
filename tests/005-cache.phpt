@@ -2,6 +2,8 @@
 Route caching - save and load from binary cache
 --EXTENSIONS--
 signalforge_routing
+--INI--
+signalforge_routing.cache_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 --FILE--
 <?php
 use Signalforge\Routing\Router;
@@ -11,66 +13,68 @@ $cacheFile = sys_get_temp_dir() . '/sf_route_cache_test.bin';
 // Clean up from previous runs
 @unlink($cacheFile);
 
+$router = new Router();
+
 // Register routes
-Router::get('/users', [UserController::class, 'index'])->name('users.index');
-Router::get('/users/{id}', [UserController::class, 'show'])
+$router->get('/users', [UserController::class, 'index'])->name('users.index');
+$router->get('/users/{id}', [UserController::class, 'show'])
     ->name('users.show')
     ->whereNumber('id');
-Router::post('/users', [UserController::class, 'store'])
+$router->post('/users', [UserController::class, 'store'])
     ->middleware(['auth', 'validate']);
-Router::get('/posts/{slug?}', [PostController::class, 'show'])
+$router->get('/posts/{slug?}', [PostController::class, 'show'])
     ->name('posts.show')
     ->defaults('slug', 'latest');
 
-Router::group(['prefix' => '/api', 'middleware' => ['api']], function() {
-    Router::get('/status', [ApiController::class, 'status'])->name('api.status');
+$router->group(['prefix' => '/api', 'middleware' => ['api']], function(Router $r) {
+    $r->get('/status', [ApiController::class, 'status'])->name('api.status');
 });
 
 // Save to cache
-$saved = Router::cache($cacheFile);
+$saved = $router->cache($cacheFile);
 var_dump($saved);
 var_dump(file_exists($cacheFile));
 
-// Check cache file is binary (starts with SFRC)
+// Check cache file is binary (starts with SFR1 authenticated magic)
 $header = file_get_contents($cacheFile, false, null, 0, 4);
-var_dump($header === 'SFRC');
+var_dump($header === 'SFR1');
 
-// Flush and reload from cache
-Router::flush();
+// Create new router and load from cache
+$router2 = new Router();
 
-// Verify routes are gone
-$result = Router::match('GET', '/users');
+// Verify routes are not there yet
+$result = $router2->match('GET', '/users');
 var_dump($result->matched()); // Should be false
 
 // Load from cache
-$loaded = Router::loadCache($cacheFile);
+$loaded = $router2->loadCache($cacheFile);
 var_dump($loaded);
 
 // Verify routes work after loading from cache
-$result = Router::match('GET', '/users');
+$result = $router2->match('GET', '/users');
 var_dump($result->matched());
 var_dump($result->getRouteName());
 
-$result = Router::match('GET', '/users/42');
+$result = $router2->match('GET', '/users/42');
 var_dump($result->matched());
 var_dump($result->getParams());
 var_dump($result->getRouteName());
 
-$result = Router::match('POST', '/users');
+$result = $router2->match('POST', '/users');
 var_dump($result->matched());
 var_dump($result->getMiddleware());
 
-$result = Router::match('GET', '/posts');
+$result = $router2->match('GET', '/posts');
 var_dump($result->matched());
 var_dump($result->getParams());
 
-$result = Router::match('GET', '/api/status');
+$result = $router2->match('GET', '/api/status');
 var_dump($result->matched());
 var_dump($result->getMiddleware());
 var_dump($result->getRouteName());
 
 // URL generation should work
-$url = Router::url('users.show', ['id' => 123]);
+$url = $router2->url('users.show', ['id' => 123]);
 var_dump($url);
 
 // Clean up
