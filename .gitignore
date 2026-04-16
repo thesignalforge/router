@@ -19,9 +19,9 @@ configure
 configure~
 configure.ac
 libtool
-Makefile
-Makefile.fragments
-Makefile.objects
+/Makefile
+/Makefile.fragments
+/Makefile.objects
 
 # Build directory
 build/
