@@ -6,31 +6,31 @@ signalforge_routing
 <?php
 use Signalforge\Routing\Router;
 
-Router::flush();
+$router = new Router();
 
 // Test group with prefix
-Router::group(['prefix' => '/api/v1'], function() {
-    Router::get('/users', function() { return 'users'; })->name('api.users');
-    Router::get('/posts', function() { return 'posts'; })->name('api.posts');
+$router->group(['prefix' => '/api/v1'], function(Router $r) {
+    $r->get('/users', function() { return 'users'; })->name('api.users');
+    $r->get('/posts', function() { return 'posts'; })->name('api.posts');
 });
 
-$result = Router::match('GET', '/api/v1/users');
+$result = $router->match('GET', '/api/v1/users');
 var_dump($result->matched());
 var_dump($result->getRouteName());
 
-$result = Router::match('GET', '/api/v1/posts');
+$result = $router->match('GET', '/api/v1/posts');
 var_dump($result->matched());
 var_dump($result->getRouteName());
 
 // Test group with middleware
-Router::group([
+$router->group([
     'prefix' => '/admin',
     'middleware' => ['auth', 'admin']
-], function() {
-    Router::get('/dashboard', function() { return 'dashboard'; });
+], function(Router $r) {
+    $r->get('/dashboard', function() { return 'dashboard'; });
 });
 
-$result = Router::match('GET', '/admin/dashboard');
+$result = $router->match('GET', '/admin/dashboard');
 var_dump($result->matched());
 var_dump($result->getMiddleware());
 

@@ -17,96 +17,96 @@ $ctx2 = new RoutingContext('POST', '/login');
 var_dump($ctx2->getDomain());
 
 // Test 3: routeUsing + dispatch (HTTP)
-Router::flush();
-Router::get('/users/{id}', fn($id) => $id)->whereNumber('id');
-Router::routeUsing(
+$router = new Router();
+$router->get('/users/{id}', fn($id) => $id)->whereNumber('id');
+$router->routeUsing(
     ['REQUEST_METHOD' => 'GET', 'REQUEST_URI' => '/users/42'],
     function(array $server): RoutingContext {
         return new RoutingContext($server['REQUEST_METHOD'], $server['REQUEST_URI']);
     }
 );
-$r = Router::dispatch();
+$r = $router->dispatch();
 var_dump($r->matched());
 var_dump($r->param('id'));
 
 // Test 4: routeUsing with object input
-Router::flush();
-Router::post('/login', fn() => 'ok');
+$router = new Router();
+$router->post('/login', fn() => 'ok');
 $input = new \stdClass();
 $input->method = 'POST';
 $input->path = '/login';
-Router::routeUsing($input, function(object $req): RoutingContext {
+$router->routeUsing($input, function(object $req): RoutingContext {
     return new RoutingContext($req->method, $req->path);
 });
-$r = Router::dispatch();
+$r = $router->dispatch();
 var_dump($r->matched());
 
 // Test 5: CLI route registration and matching
-Router::flush();
-Router::cli('cache:clear', fn() => 'cleared');
-Router::cli('users:{id}:show', fn($id) => $id)->whereNumber('id');
-$r = Router::match('CLI', 'users:42:show');
+$router = new Router();
+$router->cli('cache:clear', fn() => 'cleared');
+$router->cli('users:{id}:show', fn($id) => $id)->whereNumber('id');
+$r = $router->match('CLI', 'users:42:show');
 var_dump($r->matched());
 var_dump($r->param('id'));
 
 // Test 6: CLI route via routeUsing + dispatch
-Router::flush();
-Router::cli('app:migrate', fn() => 'migrated');
-Router::routeUsing(
+$router = new Router();
+$router->cli('app:migrate', fn() => 'migrated');
+$router->routeUsing(
     ['app', 'app:migrate'],
     function(array $argv): RoutingContext {
         return new RoutingContext('CLI', $argv[1] ?? '');
     }
 );
-$r = Router::dispatch();
+$r = $router->dispatch();
 var_dump($r->matched());
 
 // Test 7: CLI route with constraints via dispatch
-Router::flush();
-Router::cli('users:{id}:delete', fn($id) => $id)->whereNumber('id');
-Router::routeUsing(
+$router = new Router();
+$router->cli('users:{id}:delete', fn($id) => $id)->whereNumber('id');
+$router->routeUsing(
     'users:99:delete',
     function(string $cmd): RoutingContext {
         return new RoutingContext('CLI', $cmd);
     }
 );
-$r = Router::dispatch();
+$r = $router->dispatch();
 var_dump($r->matched());
 var_dump($r->param('id'));
 
 // Test 8: dispatch without routeUsing throws
-Router::flush();
+$router = new Router();
 try {
-    Router::dispatch();
+    $router->dispatch();
     echo "ERROR: should have thrown\n";
 } catch (\Signalforge\Routing\RoutingException $e) {
     echo "No context: " . $e->getMessage() . "\n";
 }
 
 // Test 9: flush clears dispatch context
-Router::flush();
-Router::get('/test', fn() => 'ok');
-Router::routeUsing(null, function($x): RoutingContext {
+$router = new Router();
+$router->get('/test', fn() => 'ok');
+$router->routeUsing(null, function($x): RoutingContext {
     return new RoutingContext('GET', '/test');
 });
-Router::flush();
+$router->flush();
 try {
-    Router::dispatch();
+    $router->dispatch();
     echo "ERROR: should have thrown\n";
 } catch (\Signalforge\Routing\RoutingException $e) {
     echo "Cleared: ok\n";
 }
 
 // Test 10: routeUsing with domain routing
-Router::flush();
-Router::get('/dashboard', fn() => 'admin')->domain('{tenant}.example.com');
-Router::routeUsing(
+$router = new Router();
+$router->get('/dashboard', fn() => 'admin')->domain('{tenant}.example.com');
+$router->routeUsing(
     ['method' => 'GET', 'path' => '/dashboard', 'domain' => 'acme.example.com'],
     function(array $req): RoutingContext {
         return new RoutingContext($req['method'], $req['path'], $req['domain']);
     }
 );
-$r = Router::dispatch();
+$r = $router->dispatch();
 var_dump($r->matched());
 var_dump($r->param('tenant'));
 
@@ -125,7 +125,7 @@ string(2) "42"
 bool(true)
 bool(true)
 string(2) "99"
-No context: No routing context set. Call Router::routeUsing() or Router::resolver() before Router::dispatch()
+No context: No routing context set. Call $router->routeUsing() or $router->resolver() before $router->dispatch()
 Cleared: ok
 bool(true)
 string(4) "acme"

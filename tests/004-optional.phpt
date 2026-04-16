@@ -6,33 +6,33 @@ signalforge_routing
 <?php
 use Signalforge\Routing\Router;
 
-Router::flush();
+$router = new Router();
 
 // Optional parameter
-Router::get('/posts/{slug?}', function($slug = null) {
+$router->get('/posts/{slug?}', function($slug = null) {
     return $slug ?? 'all';
 })->defaults('slug', 'latest');
 
 // Match with parameter
-$result = Router::match('GET', '/posts/hello-world');
+$result = $router->match('GET', '/posts/hello-world');
 var_dump($result->matched());
 var_dump($result->param('slug'));
 
 // Match without parameter (should use default)
-$result = Router::match('GET', '/posts');
+$result = $router->match('GET', '/posts');
 var_dump($result->matched());
 var_dump($result->param('slug'));
 
 // Multiple optional parameters
-Router::get('/archive/{year?}/{month?}', function($year = null, $month = null) {
+$router->get('/archive/{year?}/{month?}', function($year = null, $month = null) {
     return [$year, $month];
 })->defaults('year', '2024')->defaults('month', '01');
 
-$result = Router::match('GET', '/archive/2023/12');
+$result = $router->match('GET', '/archive/2023/12');
 var_dump($result->matched());
 var_dump($result->getParams());
 
-$result = Router::match('GET', '/archive');
+$result = $router->match('GET', '/archive');
 var_dump($result->matched());
 var_dump($result->getParams());
 
